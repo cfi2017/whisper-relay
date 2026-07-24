@@ -45,6 +45,8 @@ spec:
               value: /home/ubuntu/.cache/huggingface/hub
             - name: STT_MODEL_TTL
               value: "-1"
+            - name: TRANSCRIPTION_MODEL_ID
+              value: jayr23/whisper-large-v3-turbo-swiss-german-ct2
             - name: PRELOAD_MODELS
               value: '["jayr23/whisper-large-v3-turbo-swiss-german-ct2"]'
             - name: WHISPER__INFERENCE_DEVICE
@@ -61,6 +63,47 @@ spec:
               value: all
             - name: NVIDIA_DRIVER_CAPABILITIES
               value: compute,utility
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    python - <<'PY'
+                    import os
+                    import sys
+                    import time
+                    import urllib.error
+                    import urllib.request
+
+                    base_url = "http://127.0.0.1:8000"
+                    model_id = os.environ["TRANSCRIPTION_MODEL_ID"]
+
+                    for _ in range(360):
+                        try:
+                            urllib.request.urlopen(f"{base_url}/health", timeout=2).read()
+                            break
+                        except Exception:
+                            time.sleep(2)
+                    else:
+                        print("speaches did not become healthy before model download", file=sys.stderr)
+                        sys.exit(1)
+
+                    request = urllib.request.Request(
+                        f"{base_url}/v1/models/{model_id}",
+                        method="POST",
+                    )
+                    try:
+                        print(urllib.request.urlopen(request, timeout=1800).read().decode())
+                    except urllib.error.HTTPError as error:
+                        body = error.read().decode()
+                        if error.code in (200, 201, 409):
+                            print(body)
+                        else:
+                            print(body, file=sys.stderr)
+                            raise
+                    PY
           ports:
             - name: http
               containerPort: 8000
@@ -87,9 +130,28 @@ spec:
             timeoutSeconds: 5
             failureThreshold: 400
           readinessProbe:
-            httpGet:
-              path: /health
-              port: http
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  python - <<'PY'
+                  import json
+                  import os
+                  import sys
+                  import urllib.request
+
+                  model_id = os.environ["TRANSCRIPTION_MODEL_ID"]
+                  try:
+                      models = json.load(
+                          urllib.request.urlopen("http://127.0.0.1:8000/v1/models", timeout=2)
+                      )
+                  except Exception:
+                      sys.exit(1)
+
+                  installed = any(model.get("id") == model_id for model in models.get("data", []))
+                  sys.exit(0 if installed else 1)
+                  PY
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 6
