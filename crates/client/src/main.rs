@@ -239,6 +239,8 @@ struct AudioSource {
     name: String,
     description: String,
     media_class: String,
+    application_name: Option<String>,
+    binary_name: Option<String>,
 }
 
 type SharedAudioState = Arc<RwLock<AudioState>>;
@@ -298,10 +300,12 @@ async fn main() -> Result<()> {
     if args.list_sources {
         for source in discover_sources().await? {
             println!(
-                "{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}",
                 source.id,
                 source.identity_key(),
                 source.media_class,
+                source.capture_role(),
+                source.recommendation(),
                 source.name,
                 source.description
             );
@@ -1309,7 +1313,9 @@ impl TuiSession {
                     ),
                     Span::raw(format!(
                         "  {}  {}  id={}",
-                        source.media_class, source.name, source.id
+                        source.capture_role(),
+                        source.detail_label(),
+                        source.id
                     )),
                 ]);
                 ListItem::new(line)
@@ -1336,9 +1342,7 @@ impl TuiSession {
                 .block(Block::default().borders(Borders::ALL).title("Log"));
             frame.render_widget(log_panel, columns[1]);
 
-            let help = Paragraph::new(
-                "Up/Down or j/k move  Space toggles stream  a toggles auto-enable  q/Esc quits",
-            )
+            let help = Paragraph::new("Up/Down or j/k move  Space toggles stream  a toggles auto-enable  q/Esc quits  App playback = people you hear  Microphone = you")
             .wrap(Wrap { trim: true })
             .block(Block::default().borders(Borders::ALL).title("Keys"));
             frame.render_widget(help, outer[2]);
@@ -1385,18 +1389,27 @@ async fn discover_sources() -> Result<Vec<AudioSource>> {
                 return None;
             }
             let name = prop(&node.info.props, "node.name").unwrap_or_else(|| node.id.to_string());
+            let application_name = prop(&node.info.props, "application.name");
+            let binary_name = prop(&node.info.props, "application.process.binary");
             let description = prop(&node.info.props, "node.description")
-                .or_else(|| prop(&node.info.props, "application.name"))
+                .or_else(|| application_name.clone())
                 .unwrap_or_else(|| name.clone());
             Some(AudioSource {
                 id: node.id.to_string(),
                 name,
                 description,
                 media_class,
+                application_name,
+                binary_name,
             })
         })
         .collect::<Vec<_>>();
-    sources.sort_by(|a, b| a.description.cmp(&b.description));
+    sources.sort_by(|a, b| {
+        a.sort_rank()
+            .cmp(&b.sort_rank())
+            .then_with(|| a.description.cmp(&b.description))
+            .then_with(|| a.id.cmp(&b.id))
+    });
     Ok(sources)
 }
 
@@ -1410,6 +1423,51 @@ impl AudioSource {
             || configured == self.name
             || configured == self.description
             || configured == self.identity_key()
+    }
+
+    fn capture_role(&self) -> &'static str {
+        match self.media_class.as_str() {
+            "Stream/Output/Audio" => "App playback",
+            "Audio/Source" => "Microphone",
+            "Audio/Sink" => "Speaker output",
+            "Stream/Input/Audio" => "App mic input",
+            _ => "Audio",
+        }
+    }
+
+    fn recommendation(&self) -> &'static str {
+        match self.media_class.as_str() {
+            "Stream/Output/Audio" => "capture this for other people speaking in this app",
+            "Audio/Source" => "capture this for your microphone",
+            "Audio/Sink" => "capture this for everything routed to this output device",
+            "Stream/Input/Audio" => {
+                "usually not needed; this is what the app captures from your mic"
+            }
+            _ => "audio stream",
+        }
+    }
+
+    fn detail_label(&self) -> String {
+        let mut parts = vec![self.media_class.clone(), self.name.clone()];
+        if let Some(application_name) = &self.application_name {
+            if application_name != &self.description {
+                parts.push(format!("app={application_name}"));
+            }
+        }
+        if let Some(binary_name) = &self.binary_name {
+            parts.push(format!("bin={binary_name}"));
+        }
+        parts.join("  ")
+    }
+
+    fn sort_rank(&self) -> u8 {
+        match self.media_class.as_str() {
+            "Stream/Output/Audio" => 0,
+            "Audio/Source" => 1,
+            "Audio/Sink" => 2,
+            "Stream/Input/Audio" => 3,
+            _ => 4,
+        }
     }
 }
 
@@ -1509,11 +1567,48 @@ mod tests {
             name: "firefox.output".into(),
             description: "Firefox".into(),
             media_class: "Stream/Output/Audio".into(),
+            application_name: Some("Firefox".into()),
+            binary_name: Some("firefox".into()),
         };
         assert!(source.matches_configured("42"));
         assert!(source.matches_configured("Stream/Output/Audio:firefox.output"));
         assert!(source.matches_configured("Firefox"));
         assert!(!source.matches_configured("99"));
+    }
+
+    #[test]
+    fn labels_pipewire_sources_by_capture_purpose() {
+        let playback = AudioSource {
+            id: "42".into(),
+            name: "Playback".into(),
+            description: "Mumble".into(),
+            media_class: "Stream/Output/Audio".into(),
+            application_name: Some("Mumble".into()),
+            binary_name: None,
+        };
+        let capture = AudioSource {
+            media_class: "Stream/Input/Audio".into(),
+            ..playback.clone()
+        };
+        let mic = AudioSource {
+            media_class: "Audio/Source".into(),
+            description: "Jabra Link 380 Mono".into(),
+            ..playback.clone()
+        };
+        let sink = AudioSource {
+            media_class: "Audio/Sink".into(),
+            description: "Jabra Link 380 Analog Stereo".into(),
+            ..playback.clone()
+        };
+
+        assert_eq!(playback.capture_role(), "App playback");
+        assert!(playback.recommendation().contains("other people"));
+        assert_eq!(capture.capture_role(), "App mic input");
+        assert!(capture.recommendation().contains("usually not needed"));
+        assert_eq!(mic.capture_role(), "Microphone");
+        assert_eq!(sink.capture_role(), "Speaker output");
+        assert!(playback.sort_rank() < mic.sort_rank());
+        assert!(sink.sort_rank() < capture.sort_rank());
     }
 
     #[test]
