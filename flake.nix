@@ -1,0 +1,58 @@
+{
+  description = "Whisper Relay client/server workspace";
+
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    flake-utils.url = "github:numtide/flake-utils";
+  };
+
+  outputs = { self, nixpkgs, flake-utils }:
+    flake-utils.lib.eachDefaultSystem (system:
+      let
+        pkgs = import nixpkgs { inherit system; };
+        commonBuildInputs = with pkgs; [
+          openssl
+          pkg-config
+        ];
+        clientRuntimeInputs = with pkgs; [
+          pipewire
+          gst_all_1.gstreamer
+          gst_all_1.gst-plugins-base
+          gst_all_1.gst-plugins-good
+          gst_all_1.gst-plugins-bad
+        ];
+      in
+      {
+        devShells.default = pkgs.mkShell {
+          packages = with pkgs; [
+            cargo
+            clippy
+            rustc
+            rustfmt
+          ] ++ commonBuildInputs ++ clientRuntimeInputs;
+          RUST_BACKTRACE = "1";
+        };
+
+        packages.client = pkgs.rustPlatform.buildRustPackage {
+          pname = "whisper-relay-client";
+          version = "0.1.0";
+          src = self;
+          cargoLock.lockFile = ./Cargo.lock;
+          buildAndTestSubdir = ".";
+          cargoBuildFlags = [ "-p" "whisper-relay-client" ];
+          nativeBuildInputs = commonBuildInputs;
+          buildInputs = commonBuildInputs;
+        };
+
+        packages.server = pkgs.rustPlatform.buildRustPackage {
+          pname = "whisper-relay-server";
+          version = "0.1.0";
+          src = self;
+          cargoLock.lockFile = ./Cargo.lock;
+          buildAndTestSubdir = ".";
+          cargoBuildFlags = [ "-p" "whisper-relay-server" ];
+          nativeBuildInputs = commonBuildInputs;
+          buildInputs = commonBuildInputs;
+        };
+      });
+}

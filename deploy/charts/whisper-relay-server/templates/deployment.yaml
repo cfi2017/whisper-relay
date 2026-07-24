@@ -1,0 +1,115 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "whisper-relay-server.fullname" . }}
+  labels:
+    {{- include "whisper-relay-server.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "whisper-relay-server.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "whisper-relay-server.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "whisper-relay-server.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: server
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+              protocol: TCP
+          env:
+            - name: WHISPER_RELAY_BIND
+              value: {{ .Values.config.bind | quote }}
+            - name: WHISPER_RELAY_INSECURE_NO_AUTH
+              value: {{ .Values.config.insecureNoAuth | quote }}
+            {{- if .Values.config.insecureNoAuth }}
+            {{- else if .Values.config.oidcIssuer }}
+            - name: WHISPER_RELAY_OIDC_ISSUER
+              value: {{ .Values.config.oidcIssuer | quote }}
+            - name: WHISPER_RELAY_OIDC_AUDIENCE
+              value: {{ required "config.oidcAudience is required when config.oidcIssuer is set" .Values.config.oidcAudience | quote }}
+            {{- else }}
+            - name: WHISPER_RELAY_OIDC_ISSUER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "whisper-relay-server.oidcSecretName" . }}
+                  key: {{ .Values.existingSecrets.oidc.issuerKey }}
+            - name: WHISPER_RELAY_OIDC_AUDIENCE
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "whisper-relay-server.oidcSecretName" . }}
+                  key: {{ .Values.existingSecrets.oidc.audienceKey }}
+            {{- end }}
+            - name: WHISPER_RELAY_TRANSCRIPTION_BASE_URL
+              value: {{ required "config.transcriptionBaseUrl is required" .Values.config.transcriptionBaseUrl | quote }}
+            - name: WHISPER_RELAY_TRANSCRIPTION_MODEL
+              value: {{ .Values.config.transcriptionModel | quote }}
+            {{- if .Values.config.language }}
+            - name: WHISPER_RELAY_LANGUAGE
+              value: {{ .Values.config.language | quote }}
+            {{- end }}
+            - name: WHISPER_RELAY_CHUNK_SECONDS
+              value: {{ .Values.config.chunkSeconds | quote }}
+            - name: WHISPER_RELAY_BACKEND_DIARIZATION
+              value: {{ .Values.config.backendDiarization | quote }}
+            {{- if .Values.config.transcriptionApiKey }}
+            - name: WHISPER_RELAY_TRANSCRIPTION_API_KEY
+              value: {{ .Values.config.transcriptionApiKey | quote }}
+            {{- else }}
+            - name: WHISPER_RELAY_TRANSCRIPTION_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "whisper-relay-server.transcriptionSecretName" . }}
+                  key: {{ .Values.config.transcriptionApiKeySecret.key }}
+                  optional: {{ .Values.config.transcriptionApiKeySecret.optional }}
+            {{- end }}
+          {{- if .Values.probes.readiness.enabled }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          {{- end }}
+          {{- if .Values.probes.liveness.enabled }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+

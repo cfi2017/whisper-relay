@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whisper-relay-server
+  labels:
+    app.kubernetes.io/name: whisper-relay-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: whisper-relay-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: whisper-relay-server
+    spec:
+      containers:
+        - name: server
+          image: ghcr.io/cfi2017/whisper-relay-server:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: WHISPER_RELAY_BIND
+              value: 0.0.0.0:8080
+            - name: WHISPER_RELAY_OIDC_ISSUER
+              valueFrom:
+                secretKeyRef:
+                  name: whisper-relay-oidc
+                  key: issuer
+            - name: WHISPER_RELAY_OIDC_AUDIENCE
+              valueFrom:
+                secretKeyRef:
+                  name: whisper-relay-oidc
+                  key: audience
+            - name: WHISPER_RELAY_TRANSCRIPTION_BASE_URL
+              value: http://litellm.litellm.svc.cluster.local:4000
+            - name: WHISPER_RELAY_TRANSCRIPTION_MODEL
+              value: whisper
+            - name: WHISPER_RELAY_TRANSCRIPTION_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: whisper-relay-transcription
+                  key: api-key
+                  optional: true
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: whisper-relay-server
+spec:
+  selector:
+    app.kubernetes.io/name: whisper-relay-server
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+

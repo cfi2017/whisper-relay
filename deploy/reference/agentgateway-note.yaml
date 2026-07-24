@@ -1,0 +1,19 @@
+# Agentgateway can sit in front of OpenAI-compatible providers when the route
+# supports the API path you need. Public generic-provider examples currently
+# focus on /v1/chat/completions, while Whisper Relay needs:
+#
+#   POST /v1/audio/transcriptions
+#
+# Use this file as a reminder to configure an HTTP route or custom provider in
+# your cluster that preserves multipart uploads to the LiteLLM or KubeAI
+# transcription service.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: whisper-relay-agentgateway-note
+data:
+  required-path: /v1/audio/transcriptions
+  upstream-examples: |
+    LiteLLM: http://litellm.litellm.svc.cluster.local:4000/v1/audio/transcriptions
+    KubeAI:  http://kubeai.kubeai.svc.cluster.local:8000/openai/v1/audio/transcriptions
+
