@@ -16,3 +16,14 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: helm lint deploy/charts/whisper-relay-server
+      - run: |
+          helm template whisper-relay-server deploy/charts/whisper-relay-server
+          helm template whisper-relay-server deploy/charts/whisper-relay-server \
+            --set gateway.enabled=true \
+            --set 'gateway.hostnames[0]=whisper.example.com'
