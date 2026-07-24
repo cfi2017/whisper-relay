@@ -45,8 +45,18 @@ The server chart lives at `deploy/charts/whisper-relay-server` and supports opti
 helm lint deploy/charts/whisper-relay-server
 helm template whisper-relay-server deploy/charts/whisper-relay-server \
   --set gateway.enabled=true \
-  --set gateway.hostnames[0]=whisper.example.com
+  --set 'gateway.hostnames[0]=whisper.example.com'
 ```
+
+## Releases
+
+Commits and PR titles should use Conventional Commits, for example `feat(client): add stream picker` or `fix(server): validate jwt audience`.
+
+Pushes to `main` run semantic-release. When a release is cut, the release workflow publishes:
+
+- `ghcr.io/cfi2017/whisper-relay-server:<version>`
+- `ghcr.io/cfi2017/whisper-relay-server:latest`
+- `oci://ghcr.io/cfi2017/charts/whisper-relay-server:<version>`
 
 ## Authentication
 
