@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::Utc;
 use clap::{ArgAction, Parser, ValueEnum};
 use crossterm::{
@@ -24,9 +25,13 @@ use ratatui::{
     Terminal,
 };
 use reqwest::header;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::{
-    fs::OpenOptions, io::AsyncWriteExt, process::Command, sync::RwLock, task::JoinHandle,
+    fs::{self, OpenOptions},
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::Command,
+    sync::RwLock,
+    task::JoinHandle,
     time::sleep,
 };
 use tokio_tungstenite::{
@@ -57,6 +62,18 @@ struct CliArgs {
 
     #[arg(long, env = "WHISPER_RELAY_TOKEN")]
     token: Option<String>,
+
+    #[arg(long, env = "WHISPER_RELAY_TOKEN_CACHE")]
+    token_cache: Option<PathBuf>,
+
+    #[arg(
+        long,
+        env = "WHISPER_RELAY_DISABLE_TOKEN_CACHE",
+        action = ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    disable_token_cache: Option<bool>,
 
     #[arg(
         long,
@@ -111,6 +128,8 @@ struct FileConfig {
     oidc_issuer: Option<String>,
     oidc_client_id: Option<String>,
     token: Option<String>,
+    token_cache: Option<PathBuf>,
+    disable_token_cache: Option<bool>,
     insecure_no_auth: Option<bool>,
     diarization: Option<DiarizationArg>,
     audio_file: Option<PathBuf>,
@@ -128,6 +147,8 @@ struct ClientConfig {
     oidc_issuer: Option<String>,
     oidc_client_id: Option<String>,
     token: Option<String>,
+    token_cache: Option<PathBuf>,
+    disable_token_cache: bool,
     insecure_no_auth: bool,
     diarization: DiarizationArg,
     audio_file: Option<PathBuf>,
@@ -172,8 +193,31 @@ fn default_poll_interval() -> u64 {
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: Option<String>,
+    refresh_token: Option<String>,
+    expires_in: Option<u64>,
     error: Option<String>,
     error_description: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TokenCache {
+    issuer: String,
+    client_id: String,
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_at: i64,
+}
+
+#[derive(Debug)]
+struct AcquiredToken {
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_at: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JwtClaims {
+    exp: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -371,6 +415,15 @@ impl ClientConfig {
             oidc_issuer: args.oidc_issuer.or(file.oidc_issuer),
             oidc_client_id: args.oidc_client_id.or(file.oidc_client_id),
             token: args.token.or(file.token),
+            token_cache: args
+                .token_cache
+                .or(file.token_cache)
+                .map(expand_home)
+                .or_else(default_token_cache_path),
+            disable_token_cache: args
+                .disable_token_cache
+                .or(file.disable_token_cache)
+                .unwrap_or(false),
             insecure_no_auth: args
                 .insecure_no_auth
                 .or(file.insecure_no_auth)
@@ -430,6 +483,13 @@ fn default_config_path() -> Option<PathBuf> {
     home_dir().map(|home| home.join(".config/whisper-relay/client.toml"))
 }
 
+fn default_token_cache_path() -> Option<PathBuf> {
+    if let Some(cache_home) = std::env::var_os("XDG_CACHE_HOME") {
+        return Some(PathBuf::from(cache_home).join("whisper-relay/oidc-token.json"));
+    }
+    home_dir().map(|home| home.join(".cache/whisper-relay/oidc-token.json"))
+}
+
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
@@ -450,23 +510,59 @@ async fn acquire_token(config: &ClientConfig) -> Result<Option<String>> {
         .oidc_client_id
         .as_ref()
         .context("--oidc-client-id or WHISPER_RELAY_OIDC_CLIENT_ID is required for device login")?;
+    let cache_path = config
+        .token_cache
+        .as_ref()
+        .filter(|_| !config.disable_token_cache);
+
+    if let Some(path) = cache_path {
+        if let Some(cache) = load_token_cache(path).await? {
+            if cache.issuer == *issuer && cache.client_id == *client_id {
+                if cache.expires_at > Utc::now().timestamp() + 60 {
+                    return Ok(Some(cache.access_token));
+                }
+                if let Some(refresh_token) = cache.refresh_token {
+                    let discovery = discover_oidc(issuer).await?;
+                    if let Ok(token) =
+                        refresh_access_token(&discovery, client_id, &refresh_token).await
+                    {
+                        let access_token = token.access_token.clone();
+                        save_token_cache(path, issuer, client_id, token).await?;
+                        return Ok(Some(access_token));
+                    }
+                }
+            }
+        }
+    }
+
+    let discovery = discover_oidc(issuer).await?;
+    let token = device_login(&discovery, client_id).await?;
+    let access_token = token.access_token.clone();
+    if let Some(path) = cache_path {
+        save_token_cache(path, issuer, client_id, token).await?;
+    }
+
+    Ok(Some(access_token))
+}
+
+async fn discover_oidc(issuer: &str) -> Result<OpenIdConfiguration> {
     let discovery_url = format!(
         "{}/.well-known/openid-configuration",
         issuer.trim_end_matches('/')
     );
-    let discovery: OpenIdConfiguration = reqwest::get(&discovery_url)
+    reqwest::get(&discovery_url)
         .await?
         .error_for_status()?
         .json()
-        .await?;
+        .await
+        .with_context(|| format!("loading OIDC discovery document from {discovery_url}"))
+}
 
+async fn device_login(discovery: &OpenIdConfiguration, client_id: &str) -> Result<AcquiredToken> {
     let http = reqwest::Client::new();
     let device: DeviceAuthorizationResponse = http
         .post(&discovery.device_authorization_endpoint)
-        .form(&[
-            ("client_id", client_id.as_str()),
-            ("scope", "openid profile email"),
-        ])
+        .form(&[("client_id", client_id), ("scope", "openid profile email")])
         .send()
         .await?
         .error_for_status()?
@@ -489,14 +585,14 @@ async fn acquire_token(config: &ClientConfig) -> Result<Option<String>> {
             .form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
                 ("device_code", device.device_code.as_str()),
-                ("client_id", client_id.as_str()),
+                ("client_id", client_id),
             ])
             .send()
             .await?
             .json()
             .await?;
-        if let Some(token) = response.access_token {
-            return Ok(Some(token));
+        if response.access_token.is_some() {
+            return token_response_to_acquired(response);
         }
         match response.error.as_deref() {
             Some("authorization_pending") | Some("slow_down") => continue,
@@ -512,6 +608,94 @@ async fn acquire_token(config: &ClientConfig) -> Result<Option<String>> {
     }
 
     bail!("device authorization expired")
+}
+
+async fn refresh_access_token(
+    discovery: &OpenIdConfiguration,
+    client_id: &str,
+    refresh_token: &str,
+) -> Result<AcquiredToken> {
+    let response: TokenResponse = reqwest::Client::new()
+        .post(&discovery.token_endpoint)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", client_id),
+        ])
+        .send()
+        .await?
+        .json()
+        .await?;
+    token_response_to_acquired(response)
+}
+
+fn token_response_to_acquired(response: TokenResponse) -> Result<AcquiredToken> {
+    let access_token = response
+        .access_token
+        .context("token response omitted access_token")?;
+    let expires_at = response
+        .expires_in
+        .and_then(|expires_in| i64::try_from(expires_in).ok())
+        .map(|expires_in| Utc::now().timestamp() + expires_in)
+        .or_else(|| jwt_exp(&access_token));
+    Ok(AcquiredToken {
+        access_token,
+        refresh_token: response.refresh_token,
+        expires_at,
+    })
+}
+
+async fn load_token_cache(path: &PathBuf) -> Result<Option<TokenCache>> {
+    let contents = match fs::read_to_string(path).await {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+    };
+    serde_json::from_str(&contents)
+        .map(Some)
+        .with_context(|| format!("parsing {}", path.display()))
+}
+
+async fn save_token_cache(
+    path: &PathBuf,
+    issuer: &str,
+    client_id: &str,
+    token: AcquiredToken,
+) -> Result<()> {
+    let Some(expires_at) = token.expires_at else {
+        return Ok(());
+    };
+    let cache = TokenCache {
+        issuer: issuer.to_string(),
+        client_id: client_id.to_string(),
+        access_token: token.access_token,
+        refresh_token: token.refresh_token,
+        expires_at,
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let contents = serde_json::to_vec_pretty(&cache)?;
+    fs::write(path, contents)
+        .await
+        .with_context(|| format!("writing {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        let permissions =
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600);
+        fs::set_permissions(path, permissions)
+            .await
+            .with_context(|| format!("setting permissions on {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn jwt_exp(token: &str) -> Option<i64> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    serde_json::from_slice::<JwtClaims>(&bytes).ok()?.exp
 }
 
 async fn build_audio_state(
@@ -640,6 +824,8 @@ struct LiveCapture {
     chunk_seconds: u64,
     audio_rescan_interval: Duration,
     last_rescan: Instant,
+    restart_after: Option<Instant>,
+    restart_attempts: u32,
     state: SharedAudioState,
     logs: SharedLogs,
 }
@@ -668,6 +854,8 @@ impl AudioInput {
             last_rescan: Instant::now()
                 .checked_sub(Duration::from_secs(config.audio_rescan_seconds.max(1)))
                 .unwrap_or_else(Instant::now),
+            restart_after: None,
+            restart_attempts: 0,
             state,
             logs,
         };
@@ -707,9 +895,8 @@ impl LiveCapture {
                     return Ok(Some(bytes));
                 }
                 ChunkState::Pending => {
-                    if self.child_exited()? {
-                        self.log("audio capture exited; waiting for matching PipeWire streams")
-                            .await;
+                    if let Some(reason) = self.child_exit_reason().await? {
+                        self.schedule_restart(reason).await;
                         self.refresh_pipeline().await?;
                     }
                 }
@@ -761,34 +948,64 @@ impl LiveCapture {
             })
             .map(|source| source.id.clone())
             .collect::<Vec<_>>();
-        if active_ids == self.active_ids && self.child.is_some() && !self.child_exited()? {
+        let ids_changed = active_ids != self.active_ids;
+        if let Some(reason) = self.child_exit_reason().await? {
+            self.schedule_restart(reason).await;
+        }
+        let child_running = self.child.is_some();
+        if !ids_changed && child_running {
             return Ok(());
         }
 
-        self.stop_child();
-        self.active_ids = active_ids;
+        if ids_changed {
+            self.stop_child();
+            self.active_ids = active_ids;
+            self.restart_after = None;
+            self.restart_attempts = 0;
+            self.next_index = 0;
+            self.clean_chunk_files().await?;
+        }
+
+        if self.active_ids.is_empty() {
+            {
+                let mut state = self.state.write().await;
+                state.active_ids = self.active_ids.clone();
+                state.capture_status = "waiting for selected streams".into();
+            }
+            if ids_changed {
+                self.log("no selected PipeWire streams are currently available")
+                    .await;
+            }
+            return Ok(());
+        }
+
+        if let Some(restart_after) = self.restart_after {
+            let now = Instant::now();
+            if now < restart_after {
+                let remaining = restart_after
+                    .saturating_duration_since(now)
+                    .as_secs()
+                    .max(1);
+                let mut state = self.state.write().await;
+                state.active_ids = self.active_ids.clone();
+                state.capture_status = format!("capture crashed; retrying in {remaining}s");
+                return Ok(());
+            }
+        }
+
         {
             let mut state = self.state.write().await;
             state.active_ids = self.active_ids.clone();
-            state.capture_status = if self.active_ids.is_empty() {
-                "waiting for selected streams".into()
-            } else {
-                format!("capturing {} stream(s)", self.active_ids.len())
-            };
+            state.capture_status = format!("capturing {} stream(s)", self.active_ids.len());
         }
         self.next_index = 0;
         self.clean_chunk_files().await?;
-        if self.active_ids.is_empty() {
-            self.log("no selected PipeWire streams are currently available")
-                .await;
-            return Ok(());
-        }
-
         self.child = Some(spawn_gstreamer(
             &self.active_ids,
             &self.location_pattern,
             self.chunk_seconds,
         )?);
+        self.restart_after = None;
         self.log(format!(
             "started capture for {} stream(s)",
             self.active_ids.len()
@@ -797,15 +1014,40 @@ impl LiveCapture {
         Ok(())
     }
 
-    fn child_exited(&mut self) -> Result<bool> {
+    async fn child_exit_reason(&mut self) -> Result<Option<String>> {
         let Some(child) = &mut self.child else {
-            return Ok(true);
+            return Ok(None);
         };
-        if child.try_wait()?.is_some() {
-            self.child = None;
-            return Ok(true);
+        let Some(status) = child.try_wait()? else {
+            return Ok(None);
+        };
+        let stderr = child.stderr.take();
+        let mut reason = format!("status {status}");
+        if let Some(mut stderr) = stderr {
+            let mut text = String::new();
+            stderr.read_to_string(&mut text).await?;
+            if let Some(text) = compact_stderr(&text) {
+                reason.push_str(": ");
+                reason.push_str(&text);
+            }
         }
-        Ok(false)
+        self.child = None;
+        Ok(Some(reason))
+    }
+
+    async fn schedule_restart(&mut self, reason: String) {
+        let delay = restart_delay(self.restart_attempts);
+        self.restart_attempts = self.restart_attempts.saturating_add(1);
+        self.restart_after = Some(Instant::now() + delay);
+        {
+            let mut state = self.state.write().await;
+            state.capture_status = format!("capture crashed; retrying in {}s", delay.as_secs());
+        }
+        self.log(format!(
+            "audio capture exited ({reason}); retrying in {}s",
+            delay.as_secs()
+        ))
+        .await;
     }
 
     fn stop_child(&mut self) {
@@ -835,6 +1077,21 @@ impl Drop for LiveCapture {
     fn drop(&mut self) {
         self.stop_child();
     }
+}
+
+fn restart_delay(attempts: u32) -> Duration {
+    Duration::from_secs(2_u64.saturating_pow(attempts.min(4)))
+}
+
+fn compact_stderr(text: &str) -> Option<String> {
+    let compact = text
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())?
+        .chars()
+        .take(160)
+        .collect::<String>();
+    Some(compact)
 }
 
 enum ChunkState {
@@ -1138,7 +1395,7 @@ fn spawn_gstreamer(
     Command::new("gst-launch-1.0")
         .args(gstreamer_args(sources, location_pattern, chunk_seconds))
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .context("starting gst-launch-1.0; install gstreamer and pipewire plugins")
 }
@@ -1232,6 +1489,8 @@ mod tests {
             oidc_issuer: None,
             oidc_client_id: None,
             token: None,
+            token_cache: None,
+            disable_token_cache: None,
             insecure_no_auth: None,
             diarization: None,
             audio_file: None,
@@ -1274,6 +1533,8 @@ audio_rescan_seconds = 5
             oidc_issuer: None,
             oidc_client_id: None,
             token: None,
+            token_cache: None,
+            disable_token_cache: None,
             insecure_no_auth: None,
             diarization: None,
             audio_file: None,
@@ -1291,5 +1552,11 @@ audio_rescan_seconds = 5
         assert_eq!(config.chunk_seconds, 30);
         assert!(config.auto_enable_new_streams);
         assert_eq!(config.audio_rescan_seconds, 5);
+    }
+
+    #[test]
+    fn decodes_jwt_exp_claim() {
+        let payload = URL_SAFE_NO_PAD.encode(r#"{"exp":12345}"#);
+        assert_eq!(jwt_exp(&format!("header.{payload}.signature")), Some(12345));
     }
 }

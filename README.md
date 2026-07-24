@@ -50,6 +50,7 @@ server_url = "wss://whisper.example.com/v1/sessions/ws"
 output = "~/Documents/meetings/transcript.md"
 oidc_issuer = "https://issuer.example.com"
 oidc_client_id = "whisper-relay-device-client"
+token_cache = "~/.cache/whisper-relay/oidc-token.json"
 diarization = "prefer"
 chunk_seconds = 15
 auto_enable_new_streams = false
@@ -59,6 +60,7 @@ source = ["42", "84"]
 
 Supported `diarization` values are `prefer`, `require`, and `disable`.
 Configured `source` entries may be current PipeWire node IDs, node names, descriptions, or identity keys printed by `--list-sources`. When a selected stream disappears, the client keeps the capture session alive and reconnects matching streams when they reappear. Set `auto_enable_new_streams = true` to adopt newly discovered streams while capture is running.
+OIDC device-login tokens are cached by default at `$XDG_CACHE_HOME/whisper-relay/oidc-token.json` or `~/.cache/whisper-relay/oidc-token.json`. Use `token_cache` or `WHISPER_RELAY_TOKEN_CACHE` to choose a different path, or set `disable_token_cache = true` / `WHISPER_RELAY_DISABLE_TOKEN_CACHE=true` to force a fresh login.
 
 ## Home Manager
 
@@ -80,6 +82,7 @@ The flake exposes `homeManagerModules.default` and `homeManagerModules.whisper-r
               output = "~/Documents/meetings/transcript.md";
               oidc_issuer = "https://issuer.example.com";
               oidc_client_id = "whisper-relay-device-client";
+              token_cache = "~/.cache/whisper-relay/oidc-token.json";
               diarization = "prefer";
               chunk_seconds = 15;
               auto_enable_new_streams = true;
