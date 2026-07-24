@@ -4,7 +4,7 @@ Whisper Relay is a greenfield Rust project for live meeting transcription with l
 
 ## Components
 
-- `whisper-relay-client`: Linux/PipeWire CLI client. It discovers PipeWire audio nodes, starts a GStreamer capture pipeline, sends short Ogg/Opus chunks over WebSocket, and appends transcripts to Markdown.
+- `whisper-relay-client`: Linux/PipeWire terminal client. It opens a TUI source picker by default, starts a GStreamer capture pipeline, sends short Ogg/Opus chunks over WebSocket, and appends transcripts to Markdown.
 - `whisper-relay-server`: Kubernetes-ready Rust server. It validates OIDC bearer tokens, accepts WebSocket audio sessions, calls an OpenAI-compatible transcription endpoint, and returns normalized transcript events.
 - `whisper-relay-protocol`: Shared JSON protocol types.
 
@@ -33,6 +33,7 @@ For live capture:
 
 ```sh
 cargo run -p whisper-relay-client -- --list-sources
+cargo run -p whisper-relay-client -- --output transcript.md
 cargo run -p whisper-relay-client -- --source <pipewire-node-id> --output transcript.md
 ```
 

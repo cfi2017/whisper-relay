@@ -1,14 +1,21 @@
-use std::{
-    io::{self, Write},
-    path::PathBuf,
-    process::Stdio,
-    time::Duration,
-};
+use std::{collections::BTreeSet, io, path::PathBuf, process::Stdio, time::Duration};
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::{Parser, ValueEnum};
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
 use futures_util::{SinkExt, StreamExt};
+use ratatui::{
+    layout::{Constraint, Direction, Layout},
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    Terminal,
+};
 use reqwest::header;
 use serde::Deserialize;
 use tokio::{fs::OpenOptions, io::AsyncWriteExt, process::Command, time::sleep};
@@ -357,7 +364,7 @@ impl AudioInput {
         }
 
         let sources = if args.source.is_empty() {
-            prompt_sources().await?
+            select_sources_tui(discover_sources().await?)?
         } else {
             args.source.clone()
         };
@@ -433,32 +440,139 @@ fn chunk_path(pattern: &str, index: u64) -> PathBuf {
     PathBuf::from(pattern.replace("%05d", &format!("{index:05}")))
 }
 
-async fn prompt_sources() -> Result<Vec<String>> {
-    let sources = discover_sources().await?;
+fn select_sources_tui(sources: Vec<AudioSource>) -> Result<Vec<String>> {
     if sources.is_empty() {
         bail!("pw-dump returned no usable audio sources");
     }
-    for (idx, source) in sources.iter().enumerate() {
-        println!(
-            "{idx}: {} [{}] {}",
-            source.description, source.media_class, source.name
-        );
+
+    let mut terminal = TuiSession::enter()?;
+    let mut selected = BTreeSet::new();
+    let mut list_state = ListState::default();
+    list_state.select(Some(0));
+
+    loop {
+        terminal.draw(&sources, &selected, &mut list_state)?;
+        if !event::poll(Duration::from_millis(250))? {
+            continue;
+        }
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => bail!("source selection cancelled"),
+            KeyCode::Down | KeyCode::Char('j') => move_selection(&mut list_state, sources.len(), 1),
+            KeyCode::Up | KeyCode::Char('k') => move_selection(&mut list_state, sources.len(), -1),
+            KeyCode::Char(' ') => {
+                let idx = list_state.selected().unwrap_or(0);
+                if !selected.insert(idx) {
+                    selected.remove(&idx);
+                }
+            }
+            KeyCode::Enter => {
+                if selected.is_empty() {
+                    let idx = list_state.selected().unwrap_or(0);
+                    selected.insert(idx);
+                }
+                return Ok(selected
+                    .into_iter()
+                    .filter_map(|idx| sources.get(idx).map(|source| source.id.clone()))
+                    .collect());
+            }
+            _ => {}
+        }
     }
-    print!("Select source numbers separated by comma: ");
-    io::stdout().flush()?;
-    let mut line = String::new();
-    io::stdin().read_line(&mut line)?;
-    line.split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| {
-            let idx: usize = value.parse()?;
-            sources
-                .get(idx)
-                .map(|source| source.id.clone())
-                .context("selected source index out of range")
-        })
-        .collect()
+}
+
+struct TuiSession {
+    terminal: Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
+}
+
+impl TuiSession {
+    fn enter() -> Result<Self> {
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen)?;
+        let backend = ratatui::backend::CrosstermBackend::new(stdout);
+        let terminal = Terminal::new(backend)?;
+        Ok(Self { terminal })
+    }
+
+    fn draw(
+        &mut self,
+        sources: &[AudioSource],
+        selected: &BTreeSet<usize>,
+        list_state: &mut ListState,
+    ) -> Result<()> {
+        self.terminal.draw(|frame| {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Min(8),
+                    Constraint::Length(3),
+                ])
+                .split(frame.area());
+
+            let header = Paragraph::new("Whisper Relay")
+                .block(Block::default().borders(Borders::ALL).title("Client"));
+            frame.render_widget(header, chunks[0]);
+
+            let items = sources.iter().enumerate().map(|(idx, source)| {
+                let mark = if selected.contains(&idx) {
+                    "[x]"
+                } else {
+                    "[ ]"
+                };
+                let line = Line::from(vec![
+                    Span::raw(format!("{mark} ")),
+                    Span::styled(
+                        source.description.clone(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(format!("  {}  {}", source.media_class, source.name)),
+                ]);
+                ListItem::new(line)
+            });
+            let list = List::new(items)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Audio Streams"),
+                )
+                .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+                .highlight_symbol("> ");
+            frame.render_stateful_widget(list, chunks[1], list_state);
+
+            let help =
+                Paragraph::new("Up/Down or j/k move  Space toggles  Enter starts  Esc/q cancels")
+                    .wrap(Wrap { trim: true })
+                    .block(Block::default().borders(Borders::ALL).title("Keys"));
+            frame.render_widget(help, chunks[2]);
+        })?;
+        Ok(())
+    }
+}
+
+impl Drop for TuiSession {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = self.terminal.show_cursor();
+    }
+}
+
+fn move_selection(state: &mut ListState, len: usize, delta: isize) {
+    let current = state.selected().unwrap_or(0);
+    let next = if delta.is_negative() {
+        current.saturating_sub(delta.unsigned_abs())
+    } else {
+        (current + delta as usize).min(len.saturating_sub(1))
+    };
+    state.select(Some(next));
 }
 
 async fn discover_sources() -> Result<Vec<AudioSource>> {
