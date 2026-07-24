@@ -1440,8 +1440,6 @@ fn gstreamer_args(sources: &[String], location_pattern: &str, chunk_seconds: u64
         "!".into(),
         "audioresample".into(),
         "!".into(),
-        "audio/x-raw,rate=16000,channels=1".into(),
-        "!".into(),
         "opusenc".into(),
         "audio-type=voice".into(),
         "!".into(),
@@ -1457,8 +1455,6 @@ fn gstreamer_args(sources: &[String], location_pattern: &str, chunk_seconds: u64
         args.extend([
             "pipewiresrc".into(),
             format!("target-object={source}"),
-            "!".into(),
-            "queue".into(),
             "!".into(),
             "audioconvert".into(),
             "!".into(),
@@ -1490,6 +1486,10 @@ mod tests {
         assert!(args.contains(&"audiomixer".to_string()));
         assert!(args.contains(&"target-object=10".to_string()));
         assert!(args.contains(&"target-object=11".to_string()));
+        assert!(!args.contains(&"queue".to_string()));
+        assert!(!args
+            .iter()
+            .any(|arg| arg.starts_with("audio/x-raw,rate=16000")));
         assert!(args.contains(&"oggmux".to_string()));
         assert!(args.contains(&"multifilesink".to_string()));
         assert!(args.contains(&"next-file=max-duration".to_string()));
