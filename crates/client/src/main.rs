@@ -1,4 +1,10 @@
-use std::{collections::BTreeSet, io, path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    collections::BTreeSet,
+    io,
+    path::PathBuf,
+    process::Stdio,
+    time::{Duration, Instant},
+};
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -72,6 +78,18 @@ struct CliArgs {
 
     #[arg(long)]
     chunk_seconds: Option<u64>,
+
+    #[arg(
+        long,
+        env = "WHISPER_RELAY_AUTO_ENABLE_NEW_STREAMS",
+        action = ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    auto_enable_new_streams: Option<bool>,
+
+    #[arg(long, env = "WHISPER_RELAY_AUDIO_RESCAN_SECONDS")]
+    audio_rescan_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, ValueEnum)]
@@ -96,6 +114,8 @@ struct FileConfig {
     #[serde(default)]
     source: Vec<String>,
     chunk_seconds: Option<u64>,
+    auto_enable_new_streams: Option<bool>,
+    audio_rescan_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +130,8 @@ struct ClientConfig {
     audio_file: Option<PathBuf>,
     source: Vec<String>,
     chunk_seconds: u64,
+    auto_enable_new_streams: bool,
+    audio_rescan_seconds: u64,
 }
 
 impl From<DiarizationArg> for DiarizationPreference {
@@ -185,8 +207,12 @@ async fn main() -> Result<()> {
     if args.list_sources {
         for source in discover_sources().await? {
             println!(
-                "{}\t{}\t{}\t{}",
-                source.id, source.media_class, source.name, source.description
+                "{}\t{}\t{}\t{}\t{}",
+                source.id,
+                source.identity_key(),
+                source.media_class,
+                source.name,
+                source.description
             );
         }
         return Ok(());
@@ -291,6 +317,14 @@ impl ClientConfig {
                 args.source
             },
             chunk_seconds: args.chunk_seconds.or(file.chunk_seconds).unwrap_or(15),
+            auto_enable_new_streams: args
+                .auto_enable_new_streams
+                .or(file.auto_enable_new_streams)
+                .unwrap_or(false),
+            audio_rescan_seconds: args
+                .audio_rescan_seconds
+                .or(file.audio_rescan_seconds)
+                .unwrap_or(2),
         })
     }
 }
@@ -457,12 +491,20 @@ fn format_ms(ms: u64) -> String {
 
 enum AudioInput {
     File(Option<PathBuf>),
-    ProcessChunks {
-        _dir: tempfile::TempDir,
-        location_pattern: String,
-        next_index: u64,
-        _child: tokio::process::Child,
-    },
+    Live(Box<LiveCapture>),
+}
+
+struct LiveCapture {
+    selected_keys: BTreeSet<String>,
+    active_ids: Vec<String>,
+    location_pattern: String,
+    next_index: u64,
+    child: Option<tokio::process::Child>,
+    dir: tempfile::TempDir,
+    chunk_seconds: u64,
+    auto_enable_new_streams: bool,
+    audio_rescan_interval: Duration,
+    last_rescan: Instant,
 }
 
 impl AudioInput {
@@ -471,33 +513,33 @@ impl AudioInput {
             return Ok(Self::File(Some(path.clone())));
         }
 
-        let sources = if config.source.is_empty() {
+        let selected_keys = if config.source.is_empty() {
             select_sources_tui(discover_sources().await?)?
         } else {
-            config.source.clone()
+            resolve_configured_sources(&config.source).await?
         };
-        if sources.is_empty() {
+        if selected_keys.is_empty() {
             bail!("no PipeWire sources selected");
         }
 
         let dir = tempfile::tempdir()?;
         let location_pattern = dir.path().join("chunk-%05d.ogg").display().to_string();
-        let child = Command::new("gst-launch-1.0")
-            .args(gstreamer_args(
-                &sources,
-                &location_pattern,
-                config.chunk_seconds,
-            ))
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .context("starting gst-launch-1.0; install gstreamer and pipewire plugins")?;
-        Ok(Self::ProcessChunks {
-            _dir: dir,
+        let mut capture = LiveCapture {
+            selected_keys,
+            active_ids: Vec::new(),
+            dir,
             location_pattern,
             next_index: 0,
-            _child: child,
-        })
+            child: None,
+            chunk_seconds: config.chunk_seconds,
+            auto_enable_new_streams: config.auto_enable_new_streams,
+            audio_rescan_interval: Duration::from_secs(config.audio_rescan_seconds.max(1)),
+            last_rescan: Instant::now()
+                .checked_sub(Duration::from_secs(config.audio_rescan_seconds.max(1)))
+                .unwrap_or_else(Instant::now),
+        };
+        capture.refresh_pipeline().await?;
+        Ok(Self::Live(Box::new(capture)))
     }
 
     async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
@@ -508,37 +550,143 @@ impl AudioInput {
                 };
                 Ok(Some(tokio::fs::read(path).await?))
             }
-            Self::ProcessChunks {
-                location_pattern,
-                next_index,
-                ..
-            } => {
-                let path = chunk_path(location_pattern, *next_index);
-                wait_until_complete(&path).await?;
-                let bytes = tokio::fs::read(&path).await?;
-                let _ = tokio::fs::remove_file(&path).await;
-                *next_index += 1;
-                Ok(Some(bytes))
-            }
+            Self::Live(capture) => capture.next_chunk().await,
         }
     }
 }
 
-async fn wait_until_complete(path: &PathBuf) -> Result<()> {
+impl LiveCapture {
+    async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
+        loop {
+            if self.last_rescan.elapsed() >= self.audio_rescan_interval {
+                self.refresh_pipeline().await?;
+            }
+
+            let path = chunk_path(&self.location_pattern, self.next_index);
+            match wait_until_complete(&path, Duration::from_millis(500)).await? {
+                ChunkState::Ready => {
+                    let bytes = tokio::fs::read(&path).await?;
+                    let _ = tokio::fs::remove_file(&path).await;
+                    self.next_index += 1;
+                    return Ok(Some(bytes));
+                }
+                ChunkState::Pending => {
+                    if self.child_exited()? {
+                        warn!(
+                            "audio capture process exited; waiting for matching PipeWire streams"
+                        );
+                        self.refresh_pipeline().await?;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn refresh_pipeline(&mut self) -> Result<()> {
+        self.last_rescan = Instant::now();
+        let sources = discover_sources().await?;
+        if self.auto_enable_new_streams {
+            for source in &sources {
+                self.selected_keys.insert(source.identity_key());
+            }
+        }
+
+        let active_ids = sources
+            .iter()
+            .filter(|source| {
+                self.selected_keys
+                    .iter()
+                    .any(|selected| source.matches_configured(selected))
+            })
+            .map(|source| source.id.clone())
+            .collect::<Vec<_>>();
+        if active_ids == self.active_ids && self.child.is_some() && !self.child_exited()? {
+            return Ok(());
+        }
+
+        self.stop_child();
+        self.active_ids = active_ids;
+        self.next_index = 0;
+        self.clean_chunk_files().await?;
+        if self.active_ids.is_empty() {
+            warn!("no selected PipeWire streams are currently available");
+            return Ok(());
+        }
+
+        self.child = Some(spawn_gstreamer(
+            &self.active_ids,
+            &self.location_pattern,
+            self.chunk_seconds,
+        )?);
+        info!(
+            streams = self.active_ids.len(),
+            auto_enable_new_streams = self.auto_enable_new_streams,
+            "started audio capture"
+        );
+        Ok(())
+    }
+
+    fn child_exited(&mut self) -> Result<bool> {
+        let Some(child) = &mut self.child else {
+            return Ok(true);
+        };
+        if let Some(status) = child.try_wait()? {
+            warn!(%status, "audio capture process exited");
+            self.child = None;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn stop_child(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+        }
+    }
+
+    async fn clean_chunk_files(&self) -> Result<()> {
+        let mut entries = tokio::fs::read_dir(self.dir.path()).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("chunk-") && name.ends_with(".ogg") {
+                let _ = tokio::fs::remove_file(entry.path()).await;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for LiveCapture {
+    fn drop(&mut self) {
+        self.stop_child();
+    }
+}
+
+enum ChunkState {
+    Ready,
+    Pending,
+}
+
+async fn wait_until_complete(path: &PathBuf, timeout: Duration) -> Result<ChunkState> {
     let mut last_size = None;
     let mut stable_ticks = 0_u8;
+    let started = Instant::now();
     loop {
         if let Ok(metadata) = tokio::fs::metadata(path).await {
             let size = metadata.len();
             if size > 0 && Some(size) == last_size {
                 stable_ticks += 1;
                 if stable_ticks >= 2 {
-                    return Ok(());
+                    return Ok(ChunkState::Ready);
                 }
             } else {
                 stable_ticks = 0;
                 last_size = Some(size);
             }
+        }
+        if started.elapsed() >= timeout {
+            return Ok(ChunkState::Pending);
         }
         sleep(Duration::from_millis(250)).await;
     }
@@ -548,7 +696,28 @@ fn chunk_path(pattern: &str, index: u64) -> PathBuf {
     PathBuf::from(pattern.replace("%05d", &format!("{index:05}")))
 }
 
-fn select_sources_tui(sources: Vec<AudioSource>) -> Result<Vec<String>> {
+async fn resolve_configured_sources(configured_sources: &[String]) -> Result<BTreeSet<String>> {
+    let sources = discover_sources().await?;
+    let mut selected = BTreeSet::new();
+    for configured in configured_sources {
+        let matches = sources
+            .iter()
+            .filter(|source| source.matches_configured(configured))
+            .collect::<Vec<_>>();
+        if matches.is_empty() {
+            warn!(
+                source = configured,
+                "configured source is not currently available"
+            );
+            selected.insert(configured.clone());
+        } else {
+            selected.extend(matches.into_iter().map(AudioSource::identity_key));
+        }
+    }
+    Ok(selected)
+}
+
+fn select_sources_tui(sources: Vec<AudioSource>) -> Result<BTreeSet<String>> {
     if sources.is_empty() {
         bail!("pw-dump returned no usable audio sources");
     }
@@ -587,7 +756,7 @@ fn select_sources_tui(sources: Vec<AudioSource>) -> Result<Vec<String>> {
                 }
                 return Ok(selected
                     .into_iter()
-                    .filter_map(|idx| sources.get(idx).map(|source| source.id.clone()))
+                    .filter_map(|idx| sources.get(idx).map(AudioSource::identity_key))
                     .collect());
             }
             _ => {}
@@ -718,6 +887,32 @@ async fn discover_sources() -> Result<Vec<AudioSource>> {
     Ok(sources)
 }
 
+impl AudioSource {
+    fn identity_key(&self) -> String {
+        format!("{}:{}", self.media_class, self.name)
+    }
+
+    fn matches_configured(&self, configured: &str) -> bool {
+        configured == self.id
+            || configured == self.name
+            || configured == self.description
+            || configured == self.identity_key()
+    }
+}
+
+fn spawn_gstreamer(
+    sources: &[String],
+    location_pattern: &str,
+    chunk_seconds: u64,
+) -> Result<tokio::process::Child> {
+    Command::new("gst-launch-1.0")
+        .args(gstreamer_args(sources, location_pattern, chunk_seconds))
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("starting gst-launch-1.0; install gstreamer and pipewire plugins")
+}
+
 fn prop(props: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
     props.get(key)?.as_str().map(ToOwned::to_owned)
 }
@@ -784,6 +979,20 @@ mod tests {
     }
 
     #[test]
+    fn source_matches_current_id_or_identity_key() {
+        let source = AudioSource {
+            id: "42".into(),
+            name: "firefox.output".into(),
+            description: "Firefox".into(),
+            media_class: "Stream/Output/Audio".into(),
+        };
+        assert!(source.matches_configured("42"));
+        assert!(source.matches_configured("Stream/Output/Audio:firefox.output"));
+        assert!(source.matches_configured("Firefox"));
+        assert!(!source.matches_configured("99"));
+    }
+
+    #[test]
     fn config_defaults_are_applied() {
         let dir = tempfile::tempdir().unwrap();
         let config = ClientConfig::load(CliArgs {
@@ -799,11 +1008,15 @@ mod tests {
             source: Vec::new(),
             list_sources: false,
             chunk_seconds: None,
+            auto_enable_new_streams: None,
+            audio_rescan_seconds: None,
         })
         .unwrap();
         assert_eq!(config.server_url, "ws://127.0.0.1:8080/v1/sessions/ws");
         assert_eq!(config.output, PathBuf::from("transcript.md"));
         assert_eq!(config.chunk_seconds, 15);
+        assert!(!config.auto_enable_new_streams);
+        assert_eq!(config.audio_rescan_seconds, 2);
     }
 
     #[test]
@@ -819,6 +1032,8 @@ insecure_no_auth = true
 diarization = "disable"
 source = ["42"]
 chunk_seconds = 30
+auto_enable_new_streams = true
+audio_rescan_seconds = 5
 "#,
         )
         .unwrap();
@@ -835,6 +1050,8 @@ chunk_seconds = 30
             source: Vec::new(),
             list_sources: false,
             chunk_seconds: None,
+            auto_enable_new_streams: None,
+            audio_rescan_seconds: None,
         })
         .unwrap();
         assert_eq!(config.server_url, "wss://example.test/v1/sessions/ws");
@@ -842,5 +1059,7 @@ chunk_seconds = 30
         assert!(config.insecure_no_auth);
         assert_eq!(config.source, vec!["42"]);
         assert_eq!(config.chunk_seconds, 30);
+        assert!(config.auto_enable_new_streams);
+        assert_eq!(config.audio_rescan_seconds, 5);
     }
 }

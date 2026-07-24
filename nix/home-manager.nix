@@ -33,6 +33,8 @@ in
         oidc_client_id = "whisper-relay-device-client";
         diarization = "prefer";
         chunk_seconds = 15;
+        auto_enable_new_streams = true;
+        audio_rescan_seconds = 2;
         source = [ "42" "84" ];
       };
       description = "Settings written to xdg.configFile `whisper-relay/client.toml`.";
@@ -61,4 +63,3 @@ in
       tomlFormat.generate "whisper-relay-client.toml" cfg.settings;
   };
 }
-

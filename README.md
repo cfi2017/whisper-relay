@@ -41,6 +41,7 @@ cargo run -p whisper-relay-client -- --source <pipewire-node-id> --output transc
 
 The client reads TOML config from `--config`, `WHISPER_RELAY_CONFIG`, or `~/.config/whisper-relay/client.toml`.
 CLI flags and environment variables override config-file values.
+Use `--list-sources` to print current PipeWire node IDs and identity keys.
 
 ```toml
 server_url = "wss://whisper.example.com/v1/sessions/ws"
@@ -49,10 +50,13 @@ oidc_issuer = "https://issuer.example.com"
 oidc_client_id = "whisper-relay-device-client"
 diarization = "prefer"
 chunk_seconds = 15
+auto_enable_new_streams = false
+audio_rescan_seconds = 2
 source = ["42", "84"]
 ```
 
 Supported `diarization` values are `prefer`, `require`, and `disable`.
+Configured `source` entries may be current PipeWire node IDs, node names, descriptions, or identity keys printed by `--list-sources`. When a selected stream disappears, the client keeps the capture session alive and reconnects matching streams when they reappear. Set `auto_enable_new_streams = true` to adopt newly discovered streams while capture is running.
 
 ## Home Manager
 
@@ -76,6 +80,8 @@ The flake exposes `homeManagerModules.default` and `homeManagerModules.whisper-r
               oidc_client_id = "whisper-relay-device-client";
               diarization = "prefer";
               chunk_seconds = 15;
+              auto_enable_new_streams = true;
+              audio_rescan_seconds = 2;
             };
           };
         }
