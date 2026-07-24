@@ -1433,11 +1433,6 @@ fn prop(props: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option
 fn gstreamer_args(sources: &[String], location_pattern: &str, chunk_seconds: u64) -> Vec<String> {
     let mut args = vec![
         "-q".into(),
-        "splitmuxsink".into(),
-        "name=mux".into(),
-        "muxer-factory=oggmux".into(),
-        format!("location={location_pattern}"),
-        format!("max-size-time={}", chunk_seconds * 1_000_000_000),
         "audiomixer".into(),
         "name=mixer".into(),
         "!".into(),
@@ -1450,9 +1445,12 @@ fn gstreamer_args(sources: &[String], location_pattern: &str, chunk_seconds: u64
         "opusenc".into(),
         "audio-type=voice".into(),
         "!".into(),
-        "opusparse".into(),
+        "oggmux".into(),
         "!".into(),
-        "mux.audio_0".into(),
+        "multifilesink".into(),
+        "next-file=max-duration".into(),
+        format!("max-file-duration={}", chunk_seconds * 1_000_000_000),
+        format!("location={location_pattern}"),
     ];
 
     for source in sources {
@@ -1492,9 +1490,9 @@ mod tests {
         assert!(args.contains(&"audiomixer".to_string()));
         assert!(args.contains(&"target-object=10".to_string()));
         assert!(args.contains(&"target-object=11".to_string()));
-        assert!(args.contains(&"muxer-factory=oggmux".to_string()));
-        assert!(args.contains(&"opusparse".to_string()));
-        assert!(args.contains(&"mux.audio_0".to_string()));
+        assert!(args.contains(&"oggmux".to_string()));
+        assert!(args.contains(&"multifilesink".to_string()));
+        assert!(args.contains(&"next-file=max-duration".to_string()));
     }
 
     #[test]
