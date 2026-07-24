@@ -17,7 +17,7 @@ model_list:
 
   - model_name: whisper-swiss-german
     litellm_params:
-      model: openai/jayr23/whisper-large-v3-turbo-swiss-german-ct2
+      model: openai/swiss-german-whisper
       api_base: http://swiss-german-asr.vllm.svc.cluster.local:8000/v1
       api_key: none
     model_info:
