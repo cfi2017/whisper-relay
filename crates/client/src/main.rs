@@ -36,7 +36,7 @@ use tokio::{
 };
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{client::IntoClientRequest, Message},
+    tungstenite::{client::IntoClientRequest, error::ProtocolError, Error as WsError, Message},
 };
 use whisper_relay_protocol::{
     AudioCodec, AudioContainer, AudioFormat, ClientHello, ClientMessage, DiarizationPreference,
@@ -358,11 +358,21 @@ async fn main() -> Result<()> {
         tokio::select! {
             chunk = audio.next_chunk() => {
                 if quit_requested(&audio_state).await {
-                    ws.send(Message::Text(serde_json::to_string(&ClientMessage::AudioEnd)?.into())).await?;
+                    let audio_end = serde_json::to_string(&ClientMessage::AudioEnd)?;
+                    if let Err(err) = ws.send(Message::Text(audio_end.into())).await {
+                        if !is_expected_shutdown_ws_error(&err) {
+                            return Err(err.into());
+                        }
+                    }
                     break;
                 }
                 let Some(chunk) = chunk? else {
-                    ws.send(Message::Text(serde_json::to_string(&ClientMessage::AudioEnd)?.into())).await?;
+                    let audio_end = serde_json::to_string(&ClientMessage::AudioEnd)?;
+                    if let Err(err) = ws.send(Message::Text(audio_end.into())).await {
+                        if !is_expected_shutdown_ws_error(&err) {
+                            return Err(err.into());
+                        }
+                    }
                     break;
                 };
                 ws.send(Message::Binary(chunk.into())).await?;
@@ -377,17 +387,24 @@ async fn main() -> Result<()> {
             }
             _ = tokio::signal::ctrl_c() => {
                 request_quit(&audio_state).await;
-                ws.send(Message::Text(serde_json::to_string(&ClientMessage::AudioEnd)?.into())).await?;
+                let audio_end = serde_json::to_string(&ClientMessage::AudioEnd)?;
+                if let Err(err) = ws.send(Message::Text(audio_end.into())).await {
+                    if !is_expected_shutdown_ws_error(&err) {
+                        return Err(err.into());
+                    }
+                }
                 break;
             }
         }
     }
 
     while let Some(message) = ws.next().await {
-        match message? {
-            Message::Text(text) => handle_server_message(&mut output, &logs, &text).await?,
-            Message::Close(_) => break,
-            _ => {}
+        match message {
+            Ok(Message::Text(text)) => handle_server_message(&mut output, &logs, &text).await?,
+            Ok(Message::Close(_)) => break,
+            Ok(_) => {}
+            Err(err) if is_expected_shutdown_ws_error(&err) => break,
+            Err(err) => return Err(err.into()),
         }
     }
 
@@ -798,6 +815,15 @@ async fn write_session_header(output: &mut tokio::fs::File) -> Result<()> {
         .write_all(format!("\n\n## Session {}\n\n", Utc::now().to_rfc3339()).as_bytes())
         .await?;
     Ok(())
+}
+
+fn is_expected_shutdown_ws_error(err: &WsError) -> bool {
+    matches!(
+        err,
+        WsError::ConnectionClosed
+            | WsError::AlreadyClosed
+            | WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake)
+    )
 }
 
 fn format_ms(ms: u64) -> String {
@@ -1407,6 +1433,11 @@ fn prop(props: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option
 fn gstreamer_args(sources: &[String], location_pattern: &str, chunk_seconds: u64) -> Vec<String> {
     let mut args = vec![
         "-q".into(),
+        "splitmuxsink".into(),
+        "name=sink".into(),
+        "muxer-factory=oggmux".into(),
+        format!("location={location_pattern}"),
+        format!("max-size-time={}", chunk_seconds * 1_000_000_000),
         "audiomixer".into(),
         "name=mixer".into(),
         "!".into(),
@@ -1419,10 +1450,7 @@ fn gstreamer_args(sources: &[String], location_pattern: &str, chunk_seconds: u64
         "opusenc".into(),
         "audio-type=voice".into(),
         "!".into(),
-        "splitmuxsink".into(),
-        "muxer-factory=oggmux".into(),
-        format!("location={location_pattern}"),
-        format!("max-size-time={}", chunk_seconds * 1_000_000_000),
+        "sink.audio_0".into(),
     ];
 
     for source in sources {
@@ -1463,6 +1491,14 @@ mod tests {
         assert!(args.contains(&"target-object=10".to_string()));
         assert!(args.contains(&"target-object=11".to_string()));
         assert!(args.contains(&"muxer-factory=oggmux".to_string()));
+        assert!(args.contains(&"sink.audio_0".to_string()));
+    }
+
+    #[test]
+    fn treats_reset_without_close_as_expected_during_shutdown() {
+        assert!(is_expected_shutdown_ws_error(&WsError::Protocol(
+            ProtocolError::ResetWithoutClosingHandshake
+        )));
     }
 
     #[test]
