@@ -41,7 +41,6 @@ spec:
             - |
               exec vllm serve Flurin17/whisper-large-v3-turbo-swiss-german \
                 --served-model-name swiss-german-whisper \
-                --task transcription \
                 --dtype bfloat16 \
                 --gpu-memory-utilization 0.20 \
                 --max-model-len 448 \
