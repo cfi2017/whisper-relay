@@ -53,6 +53,15 @@ struct Args {
     )]
     transcription_model: String,
 
+    #[arg(long, env = "WHISPER_RELAY_DIARIZATION_BASE_URL")]
+    diarization_base_url: Option<String>,
+
+    #[arg(long, env = "WHISPER_RELAY_DIARIZATION_API_KEY")]
+    diarization_api_key: Option<String>,
+
+    #[arg(long, env = "WHISPER_RELAY_DIARIZATION_MODEL")]
+    diarization_model: Option<String>,
+
     #[arg(long, env = "WHISPER_RELAY_LANGUAGE")]
     language: Option<String>,
 
@@ -71,6 +80,7 @@ struct Args {
 struct AppState {
     auth: AuthConfig,
     transcription: TranscriptionClient,
+    diarization: Option<TranscriptionClient>,
     chunk_seconds: u64,
     backend_diarization: bool,
 }
@@ -144,10 +154,23 @@ async fn main() -> Result<()> {
                 .transcription_base_url
                 .trim_end_matches('/')
                 .to_string(),
-            api_key: args.transcription_api_key,
-            model: args.transcription_model,
-            language: args.language,
+            api_key: args.transcription_api_key.clone(),
+            model: args.transcription_model.clone(),
+            language: args.language.clone(),
         },
+        diarization: args
+            .diarization_base_url
+            .as_ref()
+            .map(|base_url| TranscriptionClient {
+                http: reqwest::Client::new(),
+                base_url: base_url.trim_end_matches('/').to_string(),
+                api_key: args.diarization_api_key.clone(),
+                model: args
+                    .diarization_model
+                    .clone()
+                    .unwrap_or_else(|| "whisper-diarized".into()),
+                language: args.language.clone(),
+            }),
         chunk_seconds: args.chunk_seconds,
         backend_diarization: args.backend_diarization,
     });
@@ -317,8 +340,12 @@ async fn handle_socket(state: Arc<AppState>, mut socket: WebSocket) -> Result<()
                 }
                 sequence += 1;
                 debug!(session_id = %session_id, sequence, bytes = bytes.len(), "transcribing chunk");
-                match state
-                    .transcription
+                let transcription = if state.backend_diarization {
+                    state.diarization.as_ref().unwrap_or(&state.transcription)
+                } else {
+                    &state.transcription
+                };
+                match transcription
                     .transcribe(bytes.to_vec(), state.backend_diarization)
                     .await
                 {

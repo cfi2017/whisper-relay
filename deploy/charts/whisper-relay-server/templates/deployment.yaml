@@ -65,6 +65,16 @@ spec:
               value: {{ required "config.transcriptionBaseUrl is required" .Values.config.transcriptionBaseUrl | quote }}
             - name: WHISPER_RELAY_TRANSCRIPTION_MODEL
               value: {{ .Values.config.transcriptionModel | quote }}
+            {{- if .Values.config.diarizationBaseUrl }}
+            - name: WHISPER_RELAY_DIARIZATION_BASE_URL
+              value: {{ .Values.config.diarizationBaseUrl | quote }}
+            - name: WHISPER_RELAY_DIARIZATION_MODEL
+              value: {{ .Values.config.diarizationModel | quote }}
+            {{- if .Values.config.diarizationApiKey }}
+            - name: WHISPER_RELAY_DIARIZATION_API_KEY
+              value: {{ .Values.config.diarizationApiKey | quote }}
+            {{- end }}
+            {{- end }}
             {{- if .Values.config.language }}
             - name: WHISPER_RELAY_LANGUAGE
               value: {{ .Values.config.language | quote }}
@@ -112,4 +122,3 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-

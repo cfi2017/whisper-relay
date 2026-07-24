@@ -43,6 +43,9 @@ config:
   transcriptionBaseUrl: "http://litellm.litellm.svc.cluster.local:4000"
   transcriptionModel: "whisper"
   transcriptionApiKey: ""
+  diarizationBaseUrl: ""
+  diarizationModel: "whisper-diarized"
+  diarizationApiKey: ""
   transcriptionApiKeySecret:
     name: ""
     key: api-key
@@ -88,4 +91,3 @@ gateway:
   pathPrefix: /
   annotations: {}
   labels: {}
-

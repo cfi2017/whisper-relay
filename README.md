@@ -142,9 +142,17 @@ Speaker labels require both sides to opt in. Set the client config to `diarizati
 ```yaml
 config:
   backendDiarization: true
+  diarizationBaseUrl: "http://litellm.litellm.svc.cluster.local:4000"
+  diarizationModel: "whisper-diarized"
 ```
 
-or set `WHISPER_RELAY_BACKEND_DIARIZATION=true` on the server. The relay then sends `response_format=diarized_json` and `chunking_strategy=auto` to `/v1/audio/transcriptions`; your LiteLLM/KubeAI-backed Whisper endpoint must support that diarized response format and return segment `speaker` fields.
+or set `WHISPER_RELAY_BACKEND_DIARIZATION=true`, `WHISPER_RELAY_DIARIZATION_BASE_URL`, and `WHISPER_RELAY_DIARIZATION_MODEL` on the server. The relay then sends diarized requests to that backend and plain requests to `transcriptionBaseUrl`.
+
+The diarized backend must expose `/v1/audio/transcriptions` and return JSON containing segment `speaker` fields. Reference wiring lives in:
+
+- `deploy/reference/vllm-qwen3-asr.yaml`: vLLM Qwen3-ASR deployment.
+- `deploy/reference/diarized-asr.yaml`: adapter deployment that should run speaker diarization and call Qwen3-ASR for text.
+- `deploy/reference/litellm-config.yaml`: LiteLLM model entries for `whisper` and `whisper-diarized`.
 
 ## Current V1 Boundaries
 

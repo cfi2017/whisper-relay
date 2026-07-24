@@ -12,6 +12,22 @@ helm upgrade --install whisper-relay-server deploy/charts/whisper-relay-server \
   --set config.transcriptionBaseUrl=http://litellm.litellm.svc.cluster.local:4000
 ```
 
+## Diarization backend
+
+To route speaker-label requests to a separate OpenAI-compatible backend while keeping plain ASR on the default transcription backend:
+
+```sh
+helm upgrade --install whisper-relay-server deploy/charts/whisper-relay-server \
+  --namespace whisper-relay \
+  --set config.backendDiarization=true \
+  --set config.transcriptionBaseUrl=http://litellm.litellm.svc.cluster.local:4000 \
+  --set config.transcriptionModel=whisper \
+  --set config.diarizationBaseUrl=http://litellm.litellm.svc.cluster.local:4000 \
+  --set config.diarizationModel=whisper-diarized
+```
+
+The diarized backend must return JSON with `segments[].speaker`.
+
 ## Gateway API
 
 Enable an `HTTPRoute` when your cluster already has a `Gateway`:
@@ -27,4 +43,3 @@ helm upgrade --install whisper-relay-server deploy/charts/whisper-relay-server \
 ```
 
 The route forwards all paths by default, including `/healthz` and `/v1/sessions/ws`.
-
