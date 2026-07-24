@@ -1,8 +1,9 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, VecDeque},
     io,
     path::PathBuf,
     process::Stdio,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -24,12 +25,14 @@ use ratatui::{
 };
 use reqwest::header;
 use serde::Deserialize;
-use tokio::{fs::OpenOptions, io::AsyncWriteExt, process::Command, time::sleep};
+use tokio::{
+    fs::OpenOptions, io::AsyncWriteExt, process::Command, sync::RwLock, task::JoinHandle,
+    time::sleep,
+};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{client::IntoClientRequest, Message},
 };
-use tracing::{info, warn};
 use whisper_relay_protocol::{
     AudioCodec, AudioContainer, AudioFormat, ClientHello, ClientMessage, DiarizationPreference,
     ServerMessage, TranscriptEvent, PROTOCOL_VERSION,
@@ -194,6 +197,50 @@ struct AudioSource {
     media_class: String,
 }
 
+type SharedAudioState = Arc<RwLock<AudioState>>;
+type SharedLogs = Arc<RwLock<LogBuffer>>;
+
+#[derive(Debug, Clone)]
+struct AudioState {
+    sources: Vec<AudioSource>,
+    selected_keys: BTreeSet<String>,
+    active_ids: Vec<String>,
+    auto_enable_new_streams: bool,
+    capture_status: String,
+    quit_requested: bool,
+}
+
+impl AudioState {
+    fn is_selected(&self, source: &AudioSource) -> bool {
+        self.selected_keys
+            .iter()
+            .any(|selected| source.matches_configured(selected))
+    }
+}
+
+#[derive(Debug)]
+struct LogBuffer {
+    lines: VecDeque<String>,
+    capacity: usize,
+}
+
+impl LogBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            lines: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn push(&mut self, line: impl Into<String>) {
+        if self.lines.len() == self.capacity {
+            self.lines.pop_front();
+        }
+        self.lines
+            .push_back(format!("{} {}", Utc::now().format("%H:%M:%S"), line.into()));
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -218,6 +265,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     let config = ClientConfig::load(args)?;
+    let logs = Arc::new(RwLock::new(LogBuffer::new(200)));
 
     let token = acquire_token(&config).await?;
     let mut request = config.server_url.clone().into_client_request()?;
@@ -231,6 +279,7 @@ async fn main() -> Result<()> {
     }
 
     let (mut ws, _) = connect_async(request).await?;
+    push_log(&logs, "connected to server").await;
     let hello = ClientMessage::Hello(ClientHello {
         protocol_version: PROTOCOL_VERSION,
         client_name: hostname(),
@@ -253,11 +302,21 @@ async fn main() -> Result<()> {
         .with_context(|| format!("opening {}", config.output.display()))?;
     write_session_header(&mut output).await?;
 
-    let mut audio = AudioInput::open(&config).await?;
+    let audio_state = build_audio_state(&config, &logs).await?;
+    let tui = if config.audio_file.is_none() {
+        Some(spawn_tui(audio_state.clone(), logs.clone()))
+    } else {
+        None
+    };
+    let mut audio = AudioInput::open(&config, audio_state.clone(), logs.clone()).await?;
 
     loop {
         tokio::select! {
             chunk = audio.next_chunk() => {
+                if quit_requested(&audio_state).await {
+                    ws.send(Message::Text(serde_json::to_string(&ClientMessage::AudioEnd)?.into())).await?;
+                    break;
+                }
                 let Some(chunk) = chunk? else {
                     ws.send(Message::Text(serde_json::to_string(&ClientMessage::AudioEnd)?.into())).await?;
                     break;
@@ -266,21 +325,31 @@ async fn main() -> Result<()> {
             }
             message = ws.next() => {
                 match message {
-                    Some(Ok(Message::Text(text))) => handle_server_message(&mut output, &text).await?,
+                    Some(Ok(Message::Text(text))) => handle_server_message(&mut output, &logs, &text).await?,
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(_)) => {}
                     Some(Err(err)) => return Err(err.into()),
                 }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                request_quit(&audio_state).await;
+                ws.send(Message::Text(serde_json::to_string(&ClientMessage::AudioEnd)?.into())).await?;
+                break;
             }
         }
     }
 
     while let Some(message) = ws.next().await {
         match message? {
-            Message::Text(text) => handle_server_message(&mut output, &text).await?,
+            Message::Text(text) => handle_server_message(&mut output, &logs, &text).await?,
             Message::Close(_) => break,
             _ => {}
         }
+    }
+
+    if let Some(tui) = tui {
+        request_quit(&audio_state).await;
+        let _ = tui.await;
     }
 
     Ok(())
@@ -445,18 +514,86 @@ async fn acquire_token(config: &ClientConfig) -> Result<Option<String>> {
     bail!("device authorization expired")
 }
 
-async fn handle_server_message(output: &mut tokio::fs::File, text: &str) -> Result<()> {
+async fn build_audio_state(
+    config: &ClientConfig,
+    logs: &SharedLogs,
+) -> Result<Option<SharedAudioState>> {
+    if config.audio_file.is_some() {
+        return Ok(None);
+    }
+    let sources = discover_sources().await?;
+    let selected_keys = if config.source.is_empty() {
+        BTreeSet::new()
+    } else {
+        resolve_configured_sources_from(&sources, &config.source, logs).await
+    };
+    let state = AudioState {
+        sources,
+        selected_keys,
+        active_ids: Vec::new(),
+        auto_enable_new_streams: config.auto_enable_new_streams,
+        capture_status: "starting".into(),
+        quit_requested: false,
+    };
+    Ok(Some(Arc::new(RwLock::new(state))))
+}
+
+async fn quit_requested(state: &Option<SharedAudioState>) -> bool {
+    let Some(state) = state else {
+        return false;
+    };
+    state.read().await.quit_requested
+}
+
+async fn request_quit(state: &Option<SharedAudioState>) {
+    if let Some(state) = state {
+        state.write().await.quit_requested = true;
+    }
+}
+
+async fn push_log(logs: &SharedLogs, line: impl Into<String>) {
+    logs.write().await.push(line);
+}
+
+async fn handle_server_message(
+    output: &mut tokio::fs::File,
+    logs: &SharedLogs,
+    text: &str,
+) -> Result<()> {
     match serde_json::from_str::<ServerMessage>(text)? {
         ServerMessage::SessionReady(ready) => {
-            info!(session_id = %ready.session_id, chunk_seconds = ready.chunk_seconds, "session ready");
+            push_log(logs, format!("session ready {}", ready.session_id)).await;
         }
-        ServerMessage::TranscriptFinal(event) => append_transcript(output, &event).await?,
+        ServerMessage::TranscriptFinal(event) => {
+            push_log(
+                logs,
+                format!("transcript {}", truncate_for_log(&event.text)),
+            )
+            .await;
+            append_transcript(output, &event).await?;
+        }
         ServerMessage::TranscriptPartial(_) => {}
-        ServerMessage::Warning(warning) => warn!(code = warning.code, message = warning.message),
+        ServerMessage::Warning(warning) => {
+            push_log(
+                logs,
+                format!("warning {}: {}", warning.code, warning.message),
+            )
+            .await;
+        }
         ServerMessage::Error(error) => bail!("server error {}: {}", error.code, error.message),
         ServerMessage::Pong { .. } => {}
     }
     Ok(())
+}
+
+fn truncate_for_log(text: &str) -> String {
+    const LIMIT: usize = 96;
+    if text.chars().count() <= LIMIT {
+        return text.to_string();
+    }
+    let mut truncated = text.chars().take(LIMIT).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 async fn append_transcript(output: &mut tokio::fs::File, event: &TranscriptEvent) -> Result<()> {
@@ -495,48 +632,44 @@ enum AudioInput {
 }
 
 struct LiveCapture {
-    selected_keys: BTreeSet<String>,
     active_ids: Vec<String>,
     location_pattern: String,
     next_index: u64,
     child: Option<tokio::process::Child>,
     dir: tempfile::TempDir,
     chunk_seconds: u64,
-    auto_enable_new_streams: bool,
     audio_rescan_interval: Duration,
     last_rescan: Instant,
+    state: SharedAudioState,
+    logs: SharedLogs,
 }
 
 impl AudioInput {
-    async fn open(config: &ClientConfig) -> Result<Self> {
+    async fn open(
+        config: &ClientConfig,
+        audio_state: Option<SharedAudioState>,
+        logs: SharedLogs,
+    ) -> Result<Self> {
         if let Some(path) = &config.audio_file {
             return Ok(Self::File(Some(path.clone())));
         }
-
-        let selected_keys = if config.source.is_empty() {
-            select_sources_tui(discover_sources().await?)?
-        } else {
-            resolve_configured_sources(&config.source).await?
-        };
-        if selected_keys.is_empty() {
-            bail!("no PipeWire sources selected");
-        }
+        let state = audio_state.context("live capture requires audio state")?;
 
         let dir = tempfile::tempdir()?;
         let location_pattern = dir.path().join("chunk-%05d.ogg").display().to_string();
         let mut capture = LiveCapture {
-            selected_keys,
             active_ids: Vec::new(),
             dir,
             location_pattern,
             next_index: 0,
             child: None,
             chunk_seconds: config.chunk_seconds,
-            auto_enable_new_streams: config.auto_enable_new_streams,
             audio_rescan_interval: Duration::from_secs(config.audio_rescan_seconds.max(1)),
             last_rescan: Instant::now()
                 .checked_sub(Duration::from_secs(config.audio_rescan_seconds.max(1)))
                 .unwrap_or_else(Instant::now),
+            state,
+            logs,
         };
         capture.refresh_pipeline().await?;
         Ok(Self::Live(Box::new(capture)))
@@ -561,6 +694,9 @@ impl LiveCapture {
             if self.last_rescan.elapsed() >= self.audio_rescan_interval {
                 self.refresh_pipeline().await?;
             }
+            if self.state.read().await.quit_requested {
+                return Ok(None);
+            }
 
             let path = chunk_path(&self.location_pattern, self.next_index);
             match wait_until_complete(&path, Duration::from_millis(500)).await? {
@@ -572,9 +708,8 @@ impl LiveCapture {
                 }
                 ChunkState::Pending => {
                     if self.child_exited()? {
-                        warn!(
-                            "audio capture process exited; waiting for matching PipeWire streams"
-                        );
+                        self.log("audio capture exited; waiting for matching PipeWire streams")
+                            .await;
                         self.refresh_pipeline().await?;
                     }
                 }
@@ -585,16 +720,42 @@ impl LiveCapture {
     async fn refresh_pipeline(&mut self) -> Result<()> {
         self.last_rescan = Instant::now();
         let sources = discover_sources().await?;
-        if self.auto_enable_new_streams {
-            for source in &sources {
-                self.selected_keys.insert(source.identity_key());
+        let (selected_keys, auto_enabled, quit_requested) = {
+            let mut state = self.state.write().await;
+            state.sources = sources;
+            let mut auto_enabled = Vec::new();
+            if state.auto_enable_new_streams {
+                let keys = state
+                    .sources
+                    .iter()
+                    .map(AudioSource::identity_key)
+                    .collect::<Vec<_>>();
+                for key in keys {
+                    if state.selected_keys.insert(key.clone()) {
+                        auto_enabled.push(key);
+                    }
+                }
             }
+            (
+                state.selected_keys.clone(),
+                auto_enabled,
+                state.quit_requested,
+            )
+        };
+        if quit_requested {
+            self.stop_child();
+            return Ok(());
+        }
+
+        let sources = self.state.read().await.sources.clone();
+        for key in auto_enabled {
+            self.log(format!("auto-enabled stream {key}")).await;
         }
 
         let active_ids = sources
             .iter()
             .filter(|source| {
-                self.selected_keys
+                selected_keys
                     .iter()
                     .any(|selected| source.matches_configured(selected))
             })
@@ -606,10 +767,20 @@ impl LiveCapture {
 
         self.stop_child();
         self.active_ids = active_ids;
+        {
+            let mut state = self.state.write().await;
+            state.active_ids = self.active_ids.clone();
+            state.capture_status = if self.active_ids.is_empty() {
+                "waiting for selected streams".into()
+            } else {
+                format!("capturing {} stream(s)", self.active_ids.len())
+            };
+        }
         self.next_index = 0;
         self.clean_chunk_files().await?;
         if self.active_ids.is_empty() {
-            warn!("no selected PipeWire streams are currently available");
+            self.log("no selected PipeWire streams are currently available")
+                .await;
             return Ok(());
         }
 
@@ -618,11 +789,11 @@ impl LiveCapture {
             &self.location_pattern,
             self.chunk_seconds,
         )?);
-        info!(
-            streams = self.active_ids.len(),
-            auto_enable_new_streams = self.auto_enable_new_streams,
-            "started audio capture"
-        );
+        self.log(format!(
+            "started capture for {} stream(s)",
+            self.active_ids.len()
+        ))
+        .await;
         Ok(())
     }
 
@@ -630,8 +801,7 @@ impl LiveCapture {
         let Some(child) = &mut self.child else {
             return Ok(true);
         };
-        if let Some(status) = child.try_wait()? {
-            warn!(%status, "audio capture process exited");
+        if child.try_wait()?.is_some() {
             self.child = None;
             return Ok(true);
         }
@@ -654,6 +824,10 @@ impl LiveCapture {
             }
         }
         Ok(())
+    }
+
+    async fn log(&self, line: impl Into<String>) {
+        push_log(&self.logs, line).await;
     }
 }
 
@@ -696,8 +870,11 @@ fn chunk_path(pattern: &str, index: u64) -> PathBuf {
     PathBuf::from(pattern.replace("%05d", &format!("{index:05}")))
 }
 
-async fn resolve_configured_sources(configured_sources: &[String]) -> Result<BTreeSet<String>> {
-    let sources = discover_sources().await?;
+async fn resolve_configured_sources_from(
+    sources: &[AudioSource],
+    configured_sources: &[String],
+    logs: &SharedLogs,
+) -> BTreeSet<String> {
     let mut selected = BTreeSet::new();
     for configured in configured_sources {
         let matches = sources
@@ -705,63 +882,86 @@ async fn resolve_configured_sources(configured_sources: &[String]) -> Result<BTr
             .filter(|source| source.matches_configured(configured))
             .collect::<Vec<_>>();
         if matches.is_empty() {
-            warn!(
-                source = configured,
-                "configured source is not currently available"
-            );
+            push_log(
+                logs,
+                format!("configured source not currently available: {configured}"),
+            )
+            .await;
             selected.insert(configured.clone());
         } else {
             selected.extend(matches.into_iter().map(AudioSource::identity_key));
         }
     }
-    Ok(selected)
+    selected
 }
 
-fn select_sources_tui(sources: Vec<AudioSource>) -> Result<BTreeSet<String>> {
-    if sources.is_empty() {
-        bail!("pw-dump returned no usable audio sources");
-    }
+fn spawn_tui(state: Option<SharedAudioState>, logs: SharedLogs) -> JoinHandle<Result<()>> {
+    tokio::spawn(async move {
+        let state = state.context("tui requires audio state")?;
+        let mut terminal = TuiSession::enter()?;
+        let mut list_state = ListState::default();
+        list_state.select(Some(0));
 
-    let mut terminal = TuiSession::enter()?;
-    let mut selected = BTreeSet::new();
-    let mut list_state = ListState::default();
-    list_state.select(Some(0));
+        loop {
+            let snapshot = state.read().await.clone();
+            let log_lines = logs.read().await.lines.iter().cloned().collect::<Vec<_>>();
+            if snapshot.quit_requested {
+                break;
+            }
+            if !snapshot.sources.is_empty()
+                && list_state.selected().unwrap_or(0) >= snapshot.sources.len()
+            {
+                list_state.select(Some(snapshot.sources.len() - 1));
+            }
 
-    loop {
-        terminal.draw(&sources, &selected, &mut list_state)?;
-        if !event::poll(Duration::from_millis(250))? {
-            continue;
-        }
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => bail!("source selection cancelled"),
-            KeyCode::Down | KeyCode::Char('j') => move_selection(&mut list_state, sources.len(), 1),
-            KeyCode::Up | KeyCode::Char('k') => move_selection(&mut list_state, sources.len(), -1),
-            KeyCode::Char(' ') => {
-                let idx = list_state.selected().unwrap_or(0);
-                if !selected.insert(idx) {
-                    selected.remove(&idx);
+            terminal.draw(&snapshot, &log_lines, &mut list_state)?;
+            if event::poll(Duration::from_millis(150))? {
+                let Event::Key(key) = event::read()? else {
+                    continue;
+                };
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => {
+                        state.write().await.quit_requested = true;
+                        break;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        move_selection(&mut list_state, snapshot.sources.len(), 1)
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        move_selection(&mut list_state, snapshot.sources.len(), -1)
+                    }
+                    KeyCode::Char(' ') => {
+                        let idx = list_state.selected().unwrap_or(0);
+                        if let Some(source) = snapshot.sources.get(idx) {
+                            let key = source.identity_key();
+                            let mut state = state.write().await;
+                            if !state.selected_keys.insert(key.clone()) {
+                                state.selected_keys.remove(&key);
+                                push_log(&logs, format!("disabled {}", source.description)).await;
+                            } else {
+                                push_log(&logs, format!("enabled {}", source.description)).await;
+                            }
+                        }
+                    }
+                    KeyCode::Char('a') => {
+                        let mut state = state.write().await;
+                        state.auto_enable_new_streams = !state.auto_enable_new_streams;
+                        push_log(
+                            &logs,
+                            format!("auto-enable new streams: {}", state.auto_enable_new_streams),
+                        )
+                        .await;
+                    }
+                    _ => {}
                 }
             }
-            KeyCode::Enter => {
-                if selected.is_empty() {
-                    let idx = list_state.selected().unwrap_or(0);
-                    selected.insert(idx);
-                }
-                return Ok(selected
-                    .into_iter()
-                    .filter_map(|idx| sources.get(idx).map(AudioSource::identity_key))
-                    .collect());
-            }
-            _ => {}
         }
-    }
+
+        Ok(())
+    })
 }
 
 struct TuiSession {
@@ -780,12 +980,12 @@ impl TuiSession {
 
     fn draw(
         &mut self,
-        sources: &[AudioSource],
-        selected: &BTreeSet<usize>,
+        state: &AudioState,
+        logs: &[String],
         list_state: &mut ListState,
     ) -> Result<()> {
         self.terminal.draw(|frame| {
-            let chunks = Layout::default()
+            let outer = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(3),
@@ -794,12 +994,26 @@ impl TuiSession {
                 ])
                 .split(frame.area());
 
-            let header = Paragraph::new("Whisper Relay")
-                .block(Block::default().borders(Borders::ALL).title("Client"));
-            frame.render_widget(header, chunks[0]);
+            let header = Paragraph::new(format!(
+                "Whisper Relay | {} | active {} | auto-enable {}",
+                state.capture_status,
+                state.active_ids.len(),
+                state.auto_enable_new_streams
+            ))
+            .block(Block::default().borders(Borders::ALL).title("Client"));
+            frame.render_widget(header, outer[0]);
 
-            let items = sources.iter().enumerate().map(|(idx, source)| {
-                let mark = if selected.contains(&idx) {
+            let columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+                .split(outer[1]);
+
+            let items = state.sources.iter().map(|source| {
+                let selected = state.is_selected(source);
+                let active = state.active_ids.contains(&source.id);
+                let mark = if selected && active {
+                    "[*]"
+                } else if selected {
                     "[x]"
                 } else {
                     "[ ]"
@@ -810,7 +1024,10 @@ impl TuiSession {
                         source.description.clone(),
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
-                    Span::raw(format!("  {}  {}", source.media_class, source.name)),
+                    Span::raw(format!(
+                        "  {}  {}  id={}",
+                        source.media_class, source.name, source.id
+                    )),
                 ]);
                 ListItem::new(line)
             });
@@ -822,13 +1039,26 @@ impl TuiSession {
                 )
                 .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
                 .highlight_symbol("> ");
-            frame.render_stateful_widget(list, chunks[1], list_state);
+            frame.render_stateful_widget(list, columns[0], list_state);
 
-            let help =
-                Paragraph::new("Up/Down or j/k move  Space toggles  Enter starts  Esc/q cancels")
-                    .wrap(Wrap { trim: true })
-                    .block(Block::default().borders(Borders::ALL).title("Keys"));
-            frame.render_widget(help, chunks[2]);
+            let log_items = logs
+                .iter()
+                .rev()
+                .take(columns[1].height.saturating_sub(2) as usize)
+                .rev()
+                .map(|line| Line::from(line.clone()))
+                .collect::<Vec<_>>();
+            let log_panel = Paragraph::new(log_items)
+                .wrap(Wrap { trim: true })
+                .block(Block::default().borders(Borders::ALL).title("Log"));
+            frame.render_widget(log_panel, columns[1]);
+
+            let help = Paragraph::new(
+                "Up/Down or j/k move  Space toggles stream  a toggles auto-enable  q/Esc quits",
+            )
+            .wrap(Wrap { trim: true })
+            .block(Block::default().borders(Borders::ALL).title("Keys"));
+            frame.render_widget(help, outer[2]);
         })?;
         Ok(())
     }
@@ -908,7 +1138,7 @@ fn spawn_gstreamer(
     Command::new("gst-launch-1.0")
         .args(gstreamer_args(sources, location_pattern, chunk_seconds))
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::null())
         .spawn()
         .context("starting gst-launch-1.0; install gstreamer and pipewire plugins")
 }

@@ -37,6 +37,8 @@ cargo run -p whisper-relay-client -- --output transcript.md
 cargo run -p whisper-relay-client -- --source <pipewire-node-id> --output transcript.md
 ```
 
+During live capture the TUI stays open. Use Space to enable or disable the highlighted stream while capture is running, `a` to toggle auto-enabling newly discovered streams, and `q`/Esc to stop. Stream marks are `[ ]` disabled, `[x]` selected but not currently active, and `[*]` selected and active in the capture pipeline.
+
 ## Client Config
 
 The client reads TOML config from `--config`, `WHISPER_RELAY_CONFIG`, or `~/.config/whisper-relay/client.toml`.
