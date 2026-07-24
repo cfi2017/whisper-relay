@@ -19,6 +19,9 @@ spec:
         app: swiss-german-asr
     spec:
       terminationGracePeriodSeconds: 60
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
       nodeSelector:
         kubernetes.io/arch: arm64
       volumes:
@@ -29,11 +32,30 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 8Gi
+      initContainers:
+        - name: prepare-hf-cache
+          image: busybox:1.37
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              mkdir -p /home/ubuntu/.cache/huggingface/hub
+              chown -R 1000:1000 /home/ubuntu/.cache/huggingface
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+          volumeMounts:
+            - name: cache-volume
+              mountPath: /home/ubuntu/.cache/huggingface
       containers:
         - name: speaches
           # Pin this in production once you have a known-good CUDA build.
           image: ghcr.io/speaches-ai/speaches:latest-cuda
           imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
           env:
             - name: UVICORN_HOST
               value: 0.0.0.0
