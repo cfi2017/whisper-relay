@@ -48,6 +48,8 @@ spec:
                 --host 0.0.0.0 \
                 --port 8000
           env:
+            - name: VLLM_USE_V1
+              value: "0"
             - name: HF_HOME
               value: /root/.cache/huggingface
             - name: HF_HUB_CACHE
