@@ -54,5 +54,8 @@
           nativeBuildInputs = commonBuildInputs;
           buildInputs = commonBuildInputs;
         };
-      });
+      }) // {
+        homeManagerModules.default = import ./nix/home-manager.nix self;
+        homeManagerModules.whisper-relay-client = import ./nix/home-manager.nix self;
+      };
 }

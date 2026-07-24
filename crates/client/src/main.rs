@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, io, path::PathBuf, process::Stdio, time::Durati
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
-use clap::{Parser, ValueEnum};
+use clap::{ArgAction, Parser, ValueEnum};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
@@ -30,16 +30,15 @@ use whisper_relay_protocol::{
 };
 
 #[derive(Debug, Parser)]
-struct Args {
-    #[arg(
-        long,
-        env = "WHISPER_RELAY_SERVER_URL",
-        default_value = "ws://127.0.0.1:8080/v1/sessions/ws"
-    )]
-    server_url: String,
+struct CliArgs {
+    #[arg(long, env = "WHISPER_RELAY_CONFIG")]
+    config: Option<PathBuf>,
 
-    #[arg(long, env = "WHISPER_RELAY_OUTPUT", default_value = "transcript.md")]
-    output: PathBuf,
+    #[arg(long, env = "WHISPER_RELAY_SERVER_URL")]
+    server_url: Option<String>,
+
+    #[arg(long, env = "WHISPER_RELAY_OUTPUT")]
+    output: Option<PathBuf>,
 
     #[arg(long, env = "WHISPER_RELAY_OIDC_ISSUER")]
     oidc_issuer: Option<String>,
@@ -50,11 +49,17 @@ struct Args {
     #[arg(long, env = "WHISPER_RELAY_TOKEN")]
     token: Option<String>,
 
-    #[arg(long, default_value_t = false)]
-    insecure_no_auth: bool,
+    #[arg(
+        long,
+        env = "WHISPER_RELAY_INSECURE_NO_AUTH",
+        action = ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    insecure_no_auth: Option<bool>,
 
-    #[arg(long, value_enum, default_value_t = DiarizationArg::Prefer)]
-    diarization: DiarizationArg,
+    #[arg(long, value_enum)]
+    diarization: Option<DiarizationArg>,
 
     #[arg(long)]
     audio_file: Option<PathBuf>,
@@ -65,15 +70,46 @@ struct Args {
     #[arg(long, default_value_t = false)]
     list_sources: bool,
 
-    #[arg(long, default_value_t = 15)]
-    chunk_seconds: u64,
+    #[arg(long)]
+    chunk_seconds: Option<u64>,
 }
 
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
 enum DiarizationArg {
     Prefer,
     Require,
     Disable,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileConfig {
+    server_url: Option<String>,
+    output: Option<PathBuf>,
+    oidc_issuer: Option<String>,
+    oidc_client_id: Option<String>,
+    token: Option<String>,
+    insecure_no_auth: Option<bool>,
+    diarization: Option<DiarizationArg>,
+    audio_file: Option<PathBuf>,
+    #[serde(default)]
+    source: Vec<String>,
+    chunk_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct ClientConfig {
+    server_url: String,
+    output: PathBuf,
+    oidc_issuer: Option<String>,
+    oidc_client_id: Option<String>,
+    token: Option<String>,
+    insecure_no_auth: bool,
+    diarization: DiarizationArg,
+    audio_file: Option<PathBuf>,
+    source: Vec<String>,
+    chunk_seconds: u64,
 }
 
 impl From<DiarizationArg> for DiarizationPreference {
@@ -145,7 +181,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let args = Args::parse();
+    let args = CliArgs::parse();
     if args.list_sources {
         for source in discover_sources().await? {
             println!(
@@ -155,9 +191,10 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
+    let config = ClientConfig::load(args)?;
 
-    let token = acquire_token(&args).await?;
-    let mut request = args.server_url.clone().into_client_request()?;
+    let token = acquire_token(&config).await?;
+    let mut request = config.server_url.clone().into_client_request()?;
     if let Some(token) = token {
         request.headers_mut().insert(
             header::AUTHORIZATION,
@@ -171,7 +208,7 @@ async fn main() -> Result<()> {
     let hello = ClientMessage::Hello(ClientHello {
         protocol_version: PROTOCOL_VERSION,
         client_name: hostname(),
-        diarization: args.diarization.clone().into(),
+        diarization: config.diarization.clone().into(),
         audio: AudioFormat {
             codec: AudioCodec::Opus,
             container: AudioContainer::Ogg,
@@ -185,12 +222,12 @@ async fn main() -> Result<()> {
     let mut output = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&args.output)
+        .open(&config.output)
         .await
-        .with_context(|| format!("opening {}", args.output.display()))?;
+        .with_context(|| format!("opening {}", config.output.display()))?;
     write_session_header(&mut output).await?;
 
-    let mut audio = AudioInput::open(&args).await?;
+    let mut audio = AudioInput::open(&config).await?;
 
     loop {
         tokio::select! {
@@ -223,19 +260,90 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn acquire_token(args: &Args) -> Result<Option<String>> {
-    if args.insecure_no_auth {
+impl ClientConfig {
+    fn load(args: CliArgs) -> Result<Self> {
+        let file = load_file_config(args.config.as_ref())?;
+        Ok(Self {
+            server_url: args
+                .server_url
+                .or(file.server_url)
+                .unwrap_or_else(|| "ws://127.0.0.1:8080/v1/sessions/ws".into()),
+            output: expand_home(
+                args.output
+                    .or(file.output)
+                    .unwrap_or_else(|| PathBuf::from("transcript.md")),
+            ),
+            oidc_issuer: args.oidc_issuer.or(file.oidc_issuer),
+            oidc_client_id: args.oidc_client_id.or(file.oidc_client_id),
+            token: args.token.or(file.token),
+            insecure_no_auth: args
+                .insecure_no_auth
+                .or(file.insecure_no_auth)
+                .unwrap_or(false),
+            diarization: args
+                .diarization
+                .or(file.diarization)
+                .unwrap_or(DiarizationArg::Prefer),
+            audio_file: args.audio_file.or(file.audio_file).map(expand_home),
+            source: if args.source.is_empty() {
+                file.source
+            } else {
+                args.source
+            },
+            chunk_seconds: args.chunk_seconds.or(file.chunk_seconds).unwrap_or(15),
+        })
+    }
+}
+
+fn load_file_config(path: Option<&PathBuf>) -> Result<FileConfig> {
+    let Some(path) = path.cloned().map(expand_home).or_else(default_config_path) else {
+        return Ok(FileConfig::default());
+    };
+    if !path.exists() {
+        return Ok(FileConfig::default());
+    }
+    let contents =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    toml::from_str(&contents).with_context(|| format!("parsing {}", path.display()))
+}
+
+fn expand_home(path: PathBuf) -> PathBuf {
+    let Some(value) = path.to_str() else {
+        return path;
+    };
+    if value == "~" {
+        return home_dir().unwrap_or(path);
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        return home_dir().map(|home| home.join(rest)).unwrap_or(path);
+    }
+    path
+}
+
+fn default_config_path() -> Option<PathBuf> {
+    if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME") {
+        return Some(PathBuf::from(config_home).join("whisper-relay/client.toml"));
+    }
+    home_dir().map(|home| home.join(".config/whisper-relay/client.toml"))
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+async fn acquire_token(config: &ClientConfig) -> Result<Option<String>> {
+    if config.insecure_no_auth {
         return Ok(None);
     }
-    if let Some(token) = &args.token {
+    if let Some(token) = &config.token {
         return Ok(Some(token.clone()));
     }
 
-    let issuer = args
+    let issuer = config
         .oidc_issuer
         .as_ref()
         .context("--oidc-issuer or WHISPER_RELAY_OIDC_ISSUER is required unless --token or --insecure-no-auth is used")?;
-    let client_id = args
+    let client_id = config
         .oidc_client_id
         .as_ref()
         .context("--oidc-client-id or WHISPER_RELAY_OIDC_CLIENT_ID is required for device login")?;
@@ -358,15 +466,15 @@ enum AudioInput {
 }
 
 impl AudioInput {
-    async fn open(args: &Args) -> Result<Self> {
-        if let Some(path) = &args.audio_file {
+    async fn open(config: &ClientConfig) -> Result<Self> {
+        if let Some(path) = &config.audio_file {
             return Ok(Self::File(Some(path.clone())));
         }
 
-        let sources = if args.source.is_empty() {
+        let sources = if config.source.is_empty() {
             select_sources_tui(discover_sources().await?)?
         } else {
-            args.source.clone()
+            config.source.clone()
         };
         if sources.is_empty() {
             bail!("no PipeWire sources selected");
@@ -378,7 +486,7 @@ impl AudioInput {
             .args(gstreamer_args(
                 &sources,
                 &location_pattern,
-                args.chunk_seconds,
+                config.chunk_seconds,
             ))
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -673,5 +781,66 @@ mod tests {
         assert!(args.contains(&"target-object=10".to_string()));
         assert!(args.contains(&"target-object=11".to_string()));
         assert!(args.contains(&"muxer-factory=oggmux".to_string()));
+    }
+
+    #[test]
+    fn config_defaults_are_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ClientConfig::load(CliArgs {
+            config: Some(dir.path().join("missing.toml")),
+            server_url: None,
+            output: None,
+            oidc_issuer: None,
+            oidc_client_id: None,
+            token: None,
+            insecure_no_auth: None,
+            diarization: None,
+            audio_file: None,
+            source: Vec::new(),
+            list_sources: false,
+            chunk_seconds: None,
+        })
+        .unwrap();
+        assert_eq!(config.server_url, "ws://127.0.0.1:8080/v1/sessions/ws");
+        assert_eq!(config.output, PathBuf::from("transcript.md"));
+        assert_eq!(config.chunk_seconds, 15);
+    }
+
+    #[test]
+    fn config_file_values_are_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.toml");
+        std::fs::write(
+            &path,
+            r#"
+server_url = "wss://example.test/v1/sessions/ws"
+output = "notes.md"
+insecure_no_auth = true
+diarization = "disable"
+source = ["42"]
+chunk_seconds = 30
+"#,
+        )
+        .unwrap();
+        let config = ClientConfig::load(CliArgs {
+            config: Some(path),
+            server_url: None,
+            output: None,
+            oidc_issuer: None,
+            oidc_client_id: None,
+            token: None,
+            insecure_no_auth: None,
+            diarization: None,
+            audio_file: None,
+            source: Vec::new(),
+            list_sources: false,
+            chunk_seconds: None,
+        })
+        .unwrap();
+        assert_eq!(config.server_url, "wss://example.test/v1/sessions/ws");
+        assert_eq!(config.output, PathBuf::from("notes.md"));
+        assert!(config.insecure_no_auth);
+        assert_eq!(config.source, vec!["42"]);
+        assert_eq!(config.chunk_seconds, 30);
     }
 }

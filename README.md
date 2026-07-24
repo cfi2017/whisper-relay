@@ -37,6 +37,54 @@ cargo run -p whisper-relay-client -- --output transcript.md
 cargo run -p whisper-relay-client -- --source <pipewire-node-id> --output transcript.md
 ```
 
+## Client Config
+
+The client reads TOML config from `--config`, `WHISPER_RELAY_CONFIG`, or `~/.config/whisper-relay/client.toml`.
+CLI flags and environment variables override config-file values.
+
+```toml
+server_url = "wss://whisper.example.com/v1/sessions/ws"
+output = "~/Documents/meetings/transcript.md"
+oidc_issuer = "https://issuer.example.com"
+oidc_client_id = "whisper-relay-device-client"
+diarization = "prefer"
+chunk_seconds = 15
+source = ["42", "84"]
+```
+
+Supported `diarization` values are `prefer`, `require`, and `disable`.
+
+## Home Manager
+
+The flake exposes `homeManagerModules.default` and `homeManagerModules.whisper-relay-client`.
+
+```nix
+{
+  inputs.whisper-relay.url = "github:cfi2017/whisper-relay";
+
+  outputs = { whisper-relay, ... }: {
+    homeConfigurations.me = home-manager.lib.homeManagerConfiguration {
+      modules = [
+        whisper-relay.homeManagerModules.default
+        {
+          programs.whisper-relay = {
+            enable = true;
+            settings = {
+              server_url = "wss://whisper.example.com/v1/sessions/ws";
+              output = "~/Documents/meetings/transcript.md";
+              oidc_issuer = "https://issuer.example.com";
+              oidc_client_id = "whisper-relay-device-client";
+              diarization = "prefer";
+              chunk_seconds = 15;
+            };
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
 ## Server Helm Chart
 
 The server chart lives at `deploy/charts/whisper-relay-server` and supports optional Gateway API `HTTPRoute` creation.
