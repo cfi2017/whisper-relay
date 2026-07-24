@@ -1434,7 +1434,7 @@ fn gstreamer_args(sources: &[String], location_pattern: &str, chunk_seconds: u64
     let mut args = vec![
         "-q".into(),
         "splitmuxsink".into(),
-        "name=sink".into(),
+        "name=mux".into(),
         "muxer-factory=oggmux".into(),
         format!("location={location_pattern}"),
         format!("max-size-time={}", chunk_seconds * 1_000_000_000),
@@ -1450,7 +1450,9 @@ fn gstreamer_args(sources: &[String], location_pattern: &str, chunk_seconds: u64
         "opusenc".into(),
         "audio-type=voice".into(),
         "!".into(),
-        "sink.audio_0".into(),
+        "opusparse".into(),
+        "!".into(),
+        "mux.audio_0".into(),
     ];
 
     for source in sources {
@@ -1491,7 +1493,8 @@ mod tests {
         assert!(args.contains(&"target-object=10".to_string()));
         assert!(args.contains(&"target-object=11".to_string()));
         assert!(args.contains(&"muxer-factory=oggmux".to_string()));
-        assert!(args.contains(&"sink.audio_0".to_string()));
+        assert!(args.contains(&"opusparse".to_string()));
+        assert!(args.contains(&"mux.audio_0".to_string()));
     }
 
     #[test]

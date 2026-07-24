@@ -135,6 +135,17 @@ WHISPER_RELAY_OIDC_CLIENT_ID=whisper-relay-device-client
 
 or use an existing access token with `WHISPER_RELAY_TOKEN`.
 
+## Diarization
+
+Speaker labels require both sides to opt in. Set the client config to `diarization = "prefer"` or `diarization = "require"` and enable the server/backend path with:
+
+```yaml
+config:
+  backendDiarization: true
+```
+
+or set `WHISPER_RELAY_BACKEND_DIARIZATION=true` on the server. The relay then sends `response_format=diarized_json` and `chunking_strategy=auto` to `/v1/audio/transcriptions`; your LiteLLM/KubeAI-backed Whisper endpoint must support that diarized response format and return segment `speaker` fields.
+
 ## Current V1 Boundaries
 
 - The transport is WebSocket for both control and audio.
