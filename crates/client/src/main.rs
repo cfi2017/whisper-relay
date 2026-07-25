@@ -332,12 +332,7 @@ async fn main() -> Result<()> {
         protocol_version: PROTOCOL_VERSION,
         client_name: hostname(),
         diarization: config.diarization.clone().into(),
-        audio: AudioFormat {
-            codec: AudioCodec::Opus,
-            container: AudioContainer::Ogg,
-            sample_rate_hz: 16_000,
-            channels: 1,
-        },
+        audio: config.audio_format(),
     });
     ws.send(Message::Text(serde_json::to_string(&hello)?.into()))
         .await?;
@@ -469,6 +464,30 @@ impl ClientConfig {
                 .or(file.audio_rescan_seconds)
                 .unwrap_or(2),
         })
+    }
+
+    fn audio_format(&self) -> AudioFormat {
+        if self
+            .audio_file
+            .as_ref()
+            .and_then(|path| path.extension())
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("ogg"))
+        {
+            return AudioFormat {
+                codec: AudioCodec::Opus,
+                container: AudioContainer::Ogg,
+                sample_rate_hz: 48_000,
+                channels: 1,
+            };
+        }
+
+        AudioFormat {
+            codec: AudioCodec::WavPcm16,
+            container: AudioContainer::Wav,
+            sample_rate_hz: 16_000,
+            channels: 1,
+        }
     }
 }
 
@@ -872,7 +891,7 @@ impl AudioInput {
         let state = audio_state.context("live capture requires audio state")?;
 
         let dir = tempfile::tempdir()?;
-        let location_pattern = dir.path().join("chunk-%05d.ogg").display().to_string();
+        let location_pattern = dir.path().join("chunk-%05d.wav").display().to_string();
         let mut capture = LiveCapture {
             active_ids: Vec::new(),
             dir,
@@ -917,20 +936,25 @@ impl LiveCapture {
             }
 
             let path = chunk_path(&self.location_pattern, self.next_index);
-            match wait_until_complete(&path, Duration::from_millis(500)).await? {
-                ChunkState::Ready => {
-                    let bytes = tokio::fs::read(&path).await?;
+            if let Some(reason) = self.child_exit_reason().await? {
+                if capture_completed(&reason) {
+                    let bytes = tokio::fs::read(&path).await.with_context(|| {
+                        format!("reading finalized audio chunk {}", path.display())
+                    })?;
                     let _ = tokio::fs::remove_file(&path).await;
                     self.next_index += 1;
+                    self.log(format!(
+                        "forwarding audio chunk {} ({} bytes)",
+                        self.next_index,
+                        bytes.len()
+                    ))
+                    .await;
                     return Ok(Some(bytes));
                 }
-                ChunkState::Pending => {
-                    if let Some(reason) = self.child_exit_reason().await? {
-                        self.schedule_restart(reason).await;
-                        self.refresh_pipeline().await?;
-                    }
-                }
+                self.schedule_restart(reason).await;
+                self.refresh_pipeline().await?;
             }
+            sleep(Duration::from_millis(250)).await;
         }
     }
 
@@ -1028,11 +1052,11 @@ impl LiveCapture {
             state.active_ids = self.active_ids.clone();
             state.capture_status = format!("capturing {} stream(s)", self.active_ids.len());
         }
-        self.next_index = 0;
-        self.clean_chunk_files().await?;
+        let path = chunk_path(&self.location_pattern, self.next_index);
+        let _ = tokio::fs::remove_file(&path).await;
         self.child = Some(spawn_gstreamer(
             &self.active_ids,
-            &self.location_pattern,
+            &path.display().to_string(),
             self.chunk_seconds,
         )?);
         self.restart_after = None;
@@ -1091,7 +1115,7 @@ impl LiveCapture {
         while let Some(entry) = entries.next_entry().await? {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with("chunk-") && name.ends_with(".ogg") {
+            if name.starts_with("chunk-") && (name.ends_with(".ogg") || name.ends_with(".wav")) {
                 let _ = tokio::fs::remove_file(entry.path()).await;
             }
         }
@@ -1124,33 +1148,8 @@ fn compact_stderr(text: &str) -> Option<String> {
     Some(compact)
 }
 
-enum ChunkState {
-    Ready,
-    Pending,
-}
-
-async fn wait_until_complete(path: &PathBuf, timeout: Duration) -> Result<ChunkState> {
-    let mut last_size = None;
-    let mut stable_ticks = 0_u8;
-    let started = Instant::now();
-    loop {
-        if let Ok(metadata) = tokio::fs::metadata(path).await {
-            let size = metadata.len();
-            if size > 0 && Some(size) == last_size {
-                stable_ticks += 1;
-                if stable_ticks >= 2 {
-                    return Ok(ChunkState::Ready);
-                }
-            } else {
-                stable_ticks = 0;
-                last_size = Some(size);
-            }
-        }
-        if started.elapsed() >= timeout {
-            return Ok(ChunkState::Pending);
-        }
-        sleep(Duration::from_millis(250)).await;
-    }
+fn capture_completed(reason: &str) -> bool {
+    reason.contains("exit status: 0") || reason.contains("exit status: 124")
 }
 
 fn chunk_path(pattern: &str, index: u64) -> PathBuf {
@@ -1473,23 +1472,30 @@ impl AudioSource {
 
 fn spawn_gstreamer(
     sources: &[String],
-    location_pattern: &str,
+    location: &str,
     chunk_seconds: u64,
 ) -> Result<tokio::process::Child> {
-    Command::new("gst-launch-1.0")
-        .args(gstreamer_args(sources, location_pattern, chunk_seconds))
+    Command::new("timeout")
+        .args(gstreamer_args(sources, location, chunk_seconds))
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .context("starting gst-launch-1.0; install gstreamer and pipewire plugins")
+        .context(
+            "starting timeout/gst-launch-1.0; install coreutils, gstreamer, and pipewire plugins",
+        )
 }
 
 fn prop(props: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
     props.get(key)?.as_str().map(ToOwned::to_owned)
 }
 
-fn gstreamer_args(sources: &[String], location_pattern: &str, chunk_seconds: u64) -> Vec<String> {
+fn gstreamer_args(sources: &[String], location: &str, chunk_seconds: u64) -> Vec<String> {
     let mut args = vec![
+        "-s".into(),
+        "INT".into(),
+        chunk_seconds.to_string(),
+        "gst-launch-1.0".into(),
+        "-e".into(),
         "-q".into(),
         "audiomixer".into(),
         "name=mixer".into(),
@@ -1498,15 +1504,12 @@ fn gstreamer_args(sources: &[String], location_pattern: &str, chunk_seconds: u64
         "!".into(),
         "audioresample".into(),
         "!".into(),
-        "opusenc".into(),
-        "audio-type=voice".into(),
+        "audio/x-raw,format=S16LE,rate=16000,channels=1".into(),
         "!".into(),
-        "oggmux".into(),
+        "wavenc".into(),
         "!".into(),
-        "multifilesink".into(),
-        "next-file=max-duration".into(),
-        format!("max-file-duration={}", chunk_seconds * 1_000_000_000),
-        format!("location={location_pattern}"),
+        "filesink".into(),
+        format!("location={location}"),
     ];
 
     for source in sources {
@@ -1540,17 +1543,19 @@ mod tests {
 
     #[test]
     fn builds_gstreamer_pipeline_for_two_sources() {
-        let args = gstreamer_args(&["10".into(), "11".into()], "/tmp/chunk-%05d.ogg", 15);
+        let args = gstreamer_args(&["10".into(), "11".into()], "/tmp/chunk-00000.wav", 15);
+        assert_eq!(args[0], "-s");
+        assert_eq!(args[1], "INT");
+        assert_eq!(args[2], "15");
+        assert_eq!(args[3], "gst-launch-1.0");
+        assert!(args.contains(&"-e".to_string()));
         assert!(args.contains(&"audiomixer".to_string()));
         assert!(args.contains(&"target-object=10".to_string()));
         assert!(args.contains(&"target-object=11".to_string()));
-        assert!(!args.contains(&"queue".to_string()));
-        assert!(!args
-            .iter()
-            .any(|arg| arg.starts_with("audio/x-raw,rate=16000")));
-        assert!(args.contains(&"oggmux".to_string()));
-        assert!(args.contains(&"multifilesink".to_string()));
-        assert!(args.contains(&"next-file=max-duration".to_string()));
+        assert!(args.contains(&"audio/x-raw,format=S16LE,rate=16000,channels=1".to_string()));
+        assert!(args.contains(&"wavenc".to_string()));
+        assert!(args.contains(&"filesink".to_string()));
+        assert!(args.contains(&"location=/tmp/chunk-00000.wav".to_string()));
     }
 
     #[test]
@@ -1609,6 +1614,19 @@ mod tests {
         assert_eq!(sink.capture_role(), "Speaker output");
         assert!(playback.sort_rank() < mic.sort_rank());
         assert!(sink.sort_rank() < capture.sort_rank());
+    }
+
+    #[test]
+    fn live_capture_uses_wav_and_ogg_files_keep_ogg_format() {
+        let mut config = test_config();
+        assert_eq!(config.audio_format().codec, AudioCodec::WavPcm16);
+        assert_eq!(config.audio_format().container, AudioContainer::Wav);
+        assert_eq!(config.audio_format().sample_rate_hz, 16_000);
+
+        config.audio_file = Some(PathBuf::from("sample.ogg"));
+        assert_eq!(config.audio_format().codec, AudioCodec::Opus);
+        assert_eq!(config.audio_format().container, AudioContainer::Ogg);
+        assert_eq!(config.audio_format().sample_rate_hz, 48_000);
     }
 
     #[test]
@@ -1690,5 +1708,24 @@ audio_rescan_seconds = 5
     fn decodes_jwt_exp_claim() {
         let payload = URL_SAFE_NO_PAD.encode(r#"{"exp":12345}"#);
         assert_eq!(jwt_exp(&format!("header.{payload}.signature")), Some(12345));
+    }
+
+    fn test_config() -> ClientConfig {
+        ClientConfig {
+            server_url: "ws://127.0.0.1:8080/v1/sessions/ws".into(),
+            output: PathBuf::from("transcript.md"),
+            oidc_issuer: None,
+            oidc_client_id: None,
+            token: None,
+            token_cache: None,
+            disable_token_cache: false,
+            insecure_no_auth: true,
+            diarization: DiarizationArg::Prefer,
+            audio_file: None,
+            source: Vec::new(),
+            chunk_seconds: 15,
+            auto_enable_new_streams: false,
+            audio_rescan_seconds: 2,
+        }
     }
 }

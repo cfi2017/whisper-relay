@@ -15,12 +15,14 @@
           pkg-config
         ];
         clientRuntimeInputs = with pkgs; [
+          coreutils
           pipewire
           gst_all_1.gstreamer
           gst_all_1.gst-plugins-base
           gst_all_1.gst-plugins-good
           gst_all_1.gst-plugins-bad
         ];
+        gstPluginPath = pkgs.lib.makeSearchPath "lib/gstreamer-1.0" clientRuntimeInputs;
       in
       {
         devShells.default = pkgs.mkShell {
@@ -40,8 +42,13 @@
           cargoLock.lockFile = ./Cargo.lock;
           buildAndTestSubdir = ".";
           cargoBuildFlags = [ "-p" "whisper-relay-client" ];
-          nativeBuildInputs = commonBuildInputs;
+          nativeBuildInputs = commonBuildInputs ++ [ pkgs.makeWrapper ];
           buildInputs = commonBuildInputs;
+          postInstall = ''
+            wrapProgram $out/bin/whisper-relay-client \
+              --prefix PATH : ${pkgs.lib.makeBinPath clientRuntimeInputs} \
+              --set GST_PLUGIN_SYSTEM_PATH_1_0 ${gstPluginPath}
+          '';
         };
 
         packages.server = pkgs.rustPlatform.buildRustPackage {

@@ -5,6 +5,7 @@ let
   cfg = config.programs.whisper-relay;
   tomlFormat = pkgs.formats.toml { };
   runtimePackages = with pkgs; [
+    coreutils
     pipewire
     gst_all_1.gstreamer
     gst_all_1.gst-plugins-base

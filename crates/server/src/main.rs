@@ -22,8 +22,9 @@ use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use whisper_relay_protocol::{
-    ClientHello, ClientMessage, DiarizationPreference, DiarizationStatus, ErrorMessage,
-    ServerMessage, SessionReady, TranscriptEvent, WarningMessage, PROTOCOL_VERSION,
+    AudioCodec, AudioContainer, AudioFormat, ClientHello, ClientMessage, DiarizationPreference,
+    DiarizationStatus, ErrorMessage, ServerMessage, SessionReady, TranscriptEvent, WarningMessage,
+    PROTOCOL_VERSION,
 };
 
 #[derive(Debug, Parser)]
@@ -346,7 +347,7 @@ async fn handle_socket(state: Arc<AppState>, mut socket: WebSocket) -> Result<()
                     &state.transcription
                 };
                 match transcription
-                    .transcribe(bytes.to_vec(), state.backend_diarization)
+                    .transcribe(bytes.to_vec(), state.backend_diarization, &hello.audio)
                     .await
                 {
                     Ok(events) => {
@@ -431,11 +432,13 @@ impl TranscriptionClient {
         &self,
         bytes: Vec<u8>,
         diarization: bool,
+        audio_format: &AudioFormat,
     ) -> Result<Vec<NormalizedTranscript>> {
         let url = format!("{}/v1/audio/transcriptions", self.base_url);
+        let (file_name, mime_type) = audio_part_metadata(audio_format);
         let part = multipart::Part::bytes(bytes)
-            .file_name("chunk.ogg")
-            .mime_str("audio/ogg")?;
+            .file_name(file_name)
+            .mime_str(mime_type)?;
         let mut form = multipart::Form::new()
             .text("model", self.model.clone())
             .part("file", part);
@@ -463,6 +466,14 @@ impl TranscriptionClient {
         }
 
         normalize_transcription_response(&body)
+    }
+}
+
+fn audio_part_metadata(audio_format: &AudioFormat) -> (&'static str, &'static str) {
+    match (&audio_format.codec, &audio_format.container) {
+        (AudioCodec::WavPcm16, AudioContainer::Wav) => ("chunk.wav", "audio/wav"),
+        (AudioCodec::Opus, AudioContainer::Ogg) => ("chunk.ogg", "audio/ogg"),
+        _ => ("chunk.audio", "application/octet-stream"),
     }
 }
 
@@ -538,5 +549,27 @@ mod tests {
         assert_eq!(events[0].start_ms, Some(1200));
         assert_eq!(events[0].end_ms, Some(2400));
         assert_eq!(events[0].text, "hi");
+    }
+
+    #[test]
+    fn maps_audio_formats_to_multipart_metadata() {
+        assert_eq!(
+            audio_part_metadata(&AudioFormat {
+                codec: AudioCodec::WavPcm16,
+                container: AudioContainer::Wav,
+                sample_rate_hz: 16_000,
+                channels: 1,
+            }),
+            ("chunk.wav", "audio/wav")
+        );
+        assert_eq!(
+            audio_part_metadata(&AudioFormat {
+                codec: AudioCodec::Opus,
+                container: AudioContainer::Ogg,
+                sample_rate_hz: 48_000,
+                channels: 1,
+            }),
+            ("chunk.ogg", "audio/ogg")
+        );
     }
 }
