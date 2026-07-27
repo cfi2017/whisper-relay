@@ -44,7 +44,7 @@ helm upgrade --install whisper-relay-server deploy/charts/whisper-relay-server \
 
 The route forwards all paths by default, including `/healthz` and `/v1/sessions/ws`.
 
-Full-meeting uploads default to a 512 MiB WebSocket message limit and a one-hour backend timeout. Adjust `config.maxAudioMiB` and `config.transcriptionTimeoutSeconds` for longer recordings, and apply matching limits to the Gateway implementation in front of the chart.
+Full-meeting uploads default to 512 MiB WebSocket message and frame limits and a one-hour backend timeout. Adjust `config.maxAudioMiB` and `config.transcriptionTimeoutSeconds` for longer recordings, and apply matching limits to the Gateway implementation in front of the chart.
 
 Plain WAV meetings use silence-aware server-side chunking by default. `config.targetChunkSeconds` controls normal packing, `config.maxChunkSeconds` controls forced cuts with one second of overlap, and `config.asrConcurrency` limits parallel backend requests. Smart chunking is intentionally bypassed for diarized requests so speaker identities are not reset independently in every chunk.
 

@@ -285,6 +285,7 @@ async fn ws_handler(
     }
 
     ws.max_message_size(state.max_audio_bytes)
+        .max_frame_size(state.max_audio_bytes)
         .on_upgrade(move |socket| async move {
             if let Err(err) = handle_socket(state, socket).await {
                 error!(%err, "session failed");
