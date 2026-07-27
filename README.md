@@ -53,6 +53,8 @@ Use `--list-sources` to print current PipeWire node IDs and identity keys.
 server_url = "wss://whisper.example.com/v1/sessions/ws"
 output = "~/Documents/meetings/transcript.md"
 capture_mode = "meeting"
+# Structured transcript events with absolute timestamps.
+events_output = "~/Documents/meetings/transcript.events.jsonl"
 # Optional fixed path. When omitted, a timestamped WAV is written beside output.
 # recording_output = "~/Documents/meetings/meeting.wav"
 oidc_issuer = "https://issuer.example.com"
@@ -167,4 +169,6 @@ The diarized backend must expose `/v1/audio/transcriptions` and return JSON cont
 - Audio is persisted only by the client; the server holds the uploaded meeting in memory while forwarding it to the transcription backend.
 - Diarization is requested from the transcription backend when enabled. If the backend does not return diarized segments, the client writes transcript lines with `Unknown`.
 - Full-meeting mode records 16 kHz mono PCM and sends one WAV after recording stops. This is roughly 115 MiB per hour; configure `config.maxAudioMiB` and upstream Gateway/proxy request limits for longer meetings.
+- The server applies adaptive energy VAD to plain WAV meetings, packs nearby speech into approximately 25-second chunks, uses overlap only for forced cuts, transcribes with bounded concurrency, and restores timestamps to the original meeting timeline. Diarized requests remain whole-file until cross-chunk speaker clustering is available.
+- The client appends every structured transcript event to `events_output` (default: the Markdown output path with `.events.jsonl`) for auditing and downstream processing.
 - PipeWire capture is implemented through `pw-dump` and `gst-launch-1.0`. Live mode remains available for lower latency, but full-meeting mode is the default while capture and model quality are being validated.

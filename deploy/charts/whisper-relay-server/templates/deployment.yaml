@@ -79,12 +79,24 @@ spec:
             - name: WHISPER_RELAY_LANGUAGE
               value: {{ .Values.config.language | quote }}
             {{- end }}
+            {{- if .Values.config.prompt }}
+            - name: WHISPER_RELAY_PROMPT
+              value: {{ .Values.config.prompt | quote }}
+            {{- end }}
             - name: WHISPER_RELAY_CHUNK_SECONDS
               value: {{ .Values.config.chunkSeconds | quote }}
             - name: WHISPER_RELAY_TRANSCRIPTION_TIMEOUT_SECONDS
               value: {{ .Values.config.transcriptionTimeoutSeconds | quote }}
             - name: WHISPER_RELAY_MAX_AUDIO_MIB
               value: {{ .Values.config.maxAudioMiB | quote }}
+            - name: WHISPER_RELAY_SMART_CHUNKING
+              value: {{ .Values.config.smartChunking | quote }}
+            - name: WHISPER_RELAY_ASR_CONCURRENCY
+              value: {{ .Values.config.asrConcurrency | quote }}
+            - name: WHISPER_RELAY_TARGET_CHUNK_SECONDS
+              value: {{ .Values.config.targetChunkSeconds | quote }}
+            - name: WHISPER_RELAY_MAX_CHUNK_SECONDS
+              value: {{ .Values.config.maxChunkSeconds | quote }}
             - name: WHISPER_RELAY_BACKEND_DIARIZATION
               value: {{ .Values.config.backendDiarization | quote }}
             {{- if .Values.config.transcriptionApiKey }}

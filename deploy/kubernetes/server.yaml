@@ -42,6 +42,14 @@ spec:
               value: "3600"
             - name: WHISPER_RELAY_MAX_AUDIO_MIB
               value: "512"
+            - name: WHISPER_RELAY_SMART_CHUNKING
+              value: "true"
+            - name: WHISPER_RELAY_ASR_CONCURRENCY
+              value: "4"
+            - name: WHISPER_RELAY_TARGET_CHUNK_SECONDS
+              value: "25"
+            - name: WHISPER_RELAY_MAX_CHUNK_SECONDS
+              value: "28"
             - name: WHISPER_RELAY_BACKEND_DIARIZATION
               value: "true"
             - name: WHISPER_RELAY_DIARIZATION_BASE_URL

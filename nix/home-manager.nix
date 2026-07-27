@@ -30,6 +30,7 @@ in
       example = {
         server_url = "wss://whisper.example.com/v1/sessions/ws";
         output = "~/Documents/meetings/transcript.md";
+        events_output = "~/Documents/meetings/transcript.events.jsonl";
         capture_mode = "meeting";
         oidc_issuer = "https://issuer.example.com";
         oidc_client_id = "whisper-relay-device-client";

@@ -51,9 +51,14 @@ config:
     key: api-key
     optional: true
   language: ""
+  prompt: ""
   chunkSeconds: 15
   transcriptionTimeoutSeconds: 3600
   maxAudioMiB: 512
+  smartChunking: true
+  asrConcurrency: 4
+  targetChunkSeconds: 25
+  maxChunkSeconds: 28
   backendDiarization: false
 
 secrets:

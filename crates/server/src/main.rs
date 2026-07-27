@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -13,7 +13,7 @@ use axum::{
 };
 use chrono::Utc;
 use clap::Parser;
-use futures_util::StreamExt;
+use futures_util::{stream, StreamExt};
 use jsonwebtoken::{decode, decode_header, jwk::JwkSet, DecodingKey, Validation};
 use reqwest::multipart;
 use serde::Deserialize;
@@ -66,6 +66,9 @@ struct Args {
     #[arg(long, env = "WHISPER_RELAY_LANGUAGE")]
     language: Option<String>,
 
+    #[arg(long, env = "WHISPER_RELAY_PROMPT")]
+    prompt: Option<String>,
+
     #[arg(long, env = "WHISPER_RELAY_CHUNK_SECONDS", default_value_t = 15)]
     chunk_seconds: u64,
 
@@ -78,6 +81,18 @@ struct Args {
 
     #[arg(long, env = "WHISPER_RELAY_MAX_AUDIO_MIB", default_value_t = 512)]
     max_audio_mib: usize,
+
+    #[arg(long, env = "WHISPER_RELAY_SMART_CHUNKING", default_value_t = true)]
+    smart_chunking: bool,
+
+    #[arg(long, env = "WHISPER_RELAY_ASR_CONCURRENCY", default_value_t = 4)]
+    asr_concurrency: usize,
+
+    #[arg(long, env = "WHISPER_RELAY_TARGET_CHUNK_SECONDS", default_value_t = 25)]
+    target_chunk_seconds: u64,
+
+    #[arg(long, env = "WHISPER_RELAY_MAX_CHUNK_SECONDS", default_value_t = 28)]
+    max_chunk_seconds: u64,
 
     #[arg(
         long,
@@ -95,6 +110,15 @@ struct AppState {
     chunk_seconds: u64,
     backend_diarization: bool,
     max_audio_bytes: usize,
+    smart_chunking: SmartChunkConfig,
+}
+
+#[derive(Clone)]
+struct SmartChunkConfig {
+    enabled: bool,
+    concurrency: usize,
+    target_seconds: u64,
+    max_seconds: u64,
 }
 
 #[derive(Clone)]
@@ -115,6 +139,7 @@ struct TranscriptionClient {
     model: String,
     language: Option<String>,
     timeout: Duration,
+    prompt: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,6 +196,7 @@ async fn main() -> Result<()> {
             model: args.transcription_model.clone(),
             language: args.language.clone(),
             timeout: Duration::from_secs(args.transcription_timeout_seconds),
+            prompt: args.prompt.clone(),
         },
         diarization: args
             .diarization_base_url
@@ -185,10 +211,17 @@ async fn main() -> Result<()> {
                     .unwrap_or_else(|| "whisper-diarized".into()),
                 language: args.language.clone(),
                 timeout: Duration::from_secs(args.transcription_timeout_seconds),
+                prompt: args.prompt.clone(),
             }),
         chunk_seconds: args.chunk_seconds,
         backend_diarization: args.backend_diarization,
         max_audio_bytes: args.max_audio_mib * 1024 * 1024,
+        smart_chunking: SmartChunkConfig {
+            enabled: args.smart_chunking,
+            concurrency: args.asr_concurrency.max(1),
+            target_seconds: args.target_chunk_seconds.max(5),
+            max_seconds: args.max_chunk_seconds.max(args.target_chunk_seconds).max(5),
+        },
     });
 
     let app = Router::new()
@@ -362,11 +395,26 @@ async fn handle_socket(state: Arc<AppState>, mut socket: WebSocket) -> Result<()
                 } else {
                     &state.transcription
                 };
-                match transcription
-                    .transcribe(bytes.to_vec(), state.backend_diarization, &hello.audio)
-                    .await
+                match transcribe_audio(
+                    transcription,
+                    bytes.to_vec(),
+                    state.backend_diarization,
+                    &hello.audio,
+                    &state.smart_chunking,
+                )
+                .await
                 {
                     Ok(events) => {
+                        if events.is_empty() {
+                            send_json(
+                                &mut socket,
+                                &ServerMessage::Warning(WarningMessage {
+                                    code: "no_transcript".into(),
+                                    message: "no speech or transcript text was detected".into(),
+                                }),
+                            )
+                            .await?;
+                        }
                         for event in events {
                             send_json(
                                 &mut socket,
@@ -443,6 +491,347 @@ struct NormalizedTranscript {
     text: String,
 }
 
+#[derive(Debug)]
+struct AudioChunk {
+    index: usize,
+    start_ms: u64,
+    end_ms: u64,
+    overlap_before: bool,
+    wav: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct TranscribedChunk {
+    index: usize,
+    overlap_before: bool,
+    events: Vec<NormalizedTranscript>,
+}
+
+struct PcmWav<'a> {
+    sample_rate: u32,
+    channels: u16,
+    bits_per_sample: u16,
+    data: &'a [u8],
+}
+
+async fn transcribe_audio(
+    client: &TranscriptionClient,
+    bytes: Vec<u8>,
+    diarization: bool,
+    audio_format: &AudioFormat,
+    config: &SmartChunkConfig,
+) -> Result<Vec<NormalizedTranscript>> {
+    if !config.enabled || diarization || audio_format.container != AudioContainer::Wav {
+        return client.transcribe(bytes, diarization, audio_format).await;
+    }
+
+    let wav = match parse_pcm_wav(&bytes) {
+        Ok(wav) if wav.bits_per_sample == 16 => wav,
+        Ok(_) => {
+            warn!("smart chunking supports only 16-bit PCM; forwarding whole audio");
+            return client.transcribe(bytes, false, audio_format).await;
+        }
+        Err(err) => {
+            warn!(%err, "could not parse WAV for smart chunking; forwarding whole audio");
+            return client.transcribe(bytes, false, audio_format).await;
+        }
+    };
+    let chunks = vad_chunks(&wav, config)?;
+    if chunks.is_empty() {
+        info!("VAD found no speech; skipping transcription request");
+        return Ok(Vec::new());
+    }
+    info!(
+        chunks = chunks.len(),
+        concurrency = config.concurrency,
+        "transcribing VAD-segmented meeting"
+    );
+
+    let format = AudioFormat {
+        codec: AudioCodec::WavPcm16,
+        container: AudioContainer::Wav,
+        sample_rate_hz: wav.sample_rate,
+        channels: wav.channels as u8,
+    };
+    let mut results = stream::iter(chunks.into_iter().map(|chunk| {
+        let format = format.clone();
+        async move {
+            let mut events = client.transcribe(chunk.wav, false, &format).await?;
+            for event in &mut events {
+                event.start_ms = Some(
+                    event
+                        .start_ms
+                        .map(|value| value + chunk.start_ms)
+                        .unwrap_or(chunk.start_ms),
+                );
+                event.end_ms = Some(
+                    event
+                        .end_ms
+                        .map(|value| value + chunk.start_ms)
+                        .unwrap_or(chunk.end_ms),
+                );
+            }
+            Ok::<_, anyhow::Error>(TranscribedChunk {
+                index: chunk.index,
+                overlap_before: chunk.overlap_before,
+                events,
+            })
+        }
+    }))
+    .buffer_unordered(config.concurrency)
+    .collect::<Vec<_>>()
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>>>()?;
+    results.sort_by_key(|chunk| chunk.index);
+    Ok(reconcile_chunks(results))
+}
+
+fn parse_pcm_wav(bytes: &[u8]) -> Result<PcmWav<'_>> {
+    if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        bail!("not a RIFF/WAVE file");
+    }
+    let mut offset = 12;
+    let mut format = None;
+    let mut data = None;
+    while offset + 8 <= bytes.len() {
+        let id = &bytes[offset..offset + 4];
+        let size = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into()?) as usize;
+        let start = offset + 8;
+        let end = start.checked_add(size).context("WAV chunk size overflow")?;
+        if end > bytes.len() {
+            bail!("truncated WAV chunk");
+        }
+        if id == b"fmt " && size >= 16 {
+            let codec = u16::from_le_bytes(bytes[start..start + 2].try_into()?);
+            let channels = u16::from_le_bytes(bytes[start + 2..start + 4].try_into()?);
+            let sample_rate = u32::from_le_bytes(bytes[start + 4..start + 8].try_into()?);
+            let bits = u16::from_le_bytes(bytes[start + 14..start + 16].try_into()?);
+            if codec != 1 || channels == 0 || sample_rate == 0 {
+                bail!("unsupported WAV encoding");
+            }
+            format = Some((sample_rate, channels, bits));
+        } else if id == b"data" {
+            data = Some(&bytes[start..end]);
+        }
+        offset = end + (size % 2);
+    }
+    let (sample_rate, channels, bits_per_sample) = format.context("WAV has no fmt chunk")?;
+    Ok(PcmWav {
+        sample_rate,
+        channels,
+        bits_per_sample,
+        data: data.context("WAV has no data chunk")?,
+    })
+}
+
+fn vad_chunks(wav: &PcmWav<'_>, config: &SmartChunkConfig) -> Result<Vec<AudioChunk>> {
+    let bytes_per_frame = wav.channels as usize * 2;
+    if wav.data.len() < bytes_per_frame {
+        return Ok(Vec::new());
+    }
+    let frame_samples = (wav.sample_rate as usize / 50).max(1);
+    let frame_bytes = frame_samples * bytes_per_frame;
+    let levels = wav
+        .data
+        .chunks(frame_bytes)
+        .map(rms_pcm16)
+        .collect::<Vec<_>>();
+    let mut sorted = levels.clone();
+    sorted.sort_unstable();
+    let noise = sorted[sorted.len() / 5];
+    let speech_level = sorted[sorted.len() * 9 / 10];
+    let threshold = 120_u32.max(noise.saturating_mul(3).min(speech_level / 2));
+    let speech = levels
+        .iter()
+        .map(|level| *level >= threshold)
+        .collect::<Vec<_>>();
+    let regions = speech_regions(&speech, 10, 35, 13);
+    let sample_ranges = pack_regions(
+        &regions,
+        frame_samples,
+        wav.sample_rate as usize,
+        config.target_seconds as usize,
+        config.max_seconds as usize,
+    );
+
+    sample_ranges
+        .into_iter()
+        .enumerate()
+        .map(|(index, (start_sample, end_sample, overlap_before))| {
+            let start_byte = start_sample * bytes_per_frame;
+            let end_byte = (end_sample * bytes_per_frame).min(wav.data.len());
+            Ok(AudioChunk {
+                index,
+                start_ms: start_sample as u64 * 1000 / wav.sample_rate as u64,
+                end_ms: end_sample as u64 * 1000 / wav.sample_rate as u64,
+                overlap_before,
+                wav: pcm_to_wav(
+                    &wav.data[start_byte..end_byte],
+                    wav.sample_rate,
+                    wav.channels,
+                )?,
+            })
+        })
+        .collect()
+}
+
+fn rms_pcm16(bytes: &[u8]) -> u32 {
+    let mut sum = 0_u64;
+    let mut count = 0_u64;
+    for sample in bytes.chunks_exact(2) {
+        let value = i16::from_le_bytes([sample[0], sample[1]]) as i64;
+        sum = sum.saturating_add((value * value) as u64);
+        count += 1;
+    }
+    sum.checked_div(count)
+        .map(|mean| (mean as f64).sqrt() as u32)
+        .unwrap_or(0)
+}
+
+fn speech_regions(
+    speech: &[bool],
+    min_speech_frames: usize,
+    merge_gap_frames: usize,
+    padding_frames: usize,
+) -> Vec<(usize, usize)> {
+    let mut raw = Vec::new();
+    let mut start = None;
+    for (index, active) in speech
+        .iter()
+        .copied()
+        .chain(std::iter::once(false))
+        .enumerate()
+    {
+        match (start, active) {
+            (None, true) => start = Some(index),
+            (Some(begin), false) => {
+                if index - begin >= min_speech_frames {
+                    raw.push((
+                        begin.saturating_sub(padding_frames),
+                        (index + padding_frames).min(speech.len()),
+                    ));
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for region in raw {
+        if let Some(last) = merged.last_mut() {
+            if region.0 <= last.1 + merge_gap_frames {
+                last.1 = last.1.max(region.1);
+                continue;
+            }
+        }
+        merged.push(region);
+    }
+    merged
+}
+
+fn pack_regions(
+    regions: &[(usize, usize)],
+    frame_samples: usize,
+    sample_rate: usize,
+    target_seconds: usize,
+    max_seconds: usize,
+) -> Vec<(usize, usize, bool)> {
+    let target = target_seconds * sample_rate;
+    let hard_max = max_seconds * sample_rate;
+    let overlap = sample_rate;
+    let mut chunks = Vec::new();
+    let mut pending: Option<(usize, usize, bool)> = None;
+    for &(start_frame, end_frame) in regions {
+        let mut start = start_frame * frame_samples;
+        let end = end_frame * frame_samples;
+        let mut overlap_before = false;
+        if let Some((pending_start, pending_end, pending_overlap)) = pending.take() {
+            if end - pending_start <= target {
+                start = pending_start;
+                overlap_before = pending_overlap;
+            } else {
+                chunks.push((pending_start, pending_end, pending_overlap));
+            }
+        }
+        while end.saturating_sub(start) > hard_max {
+            let split = start + hard_max;
+            chunks.push((start, split, overlap_before));
+            start = split.saturating_sub(overlap);
+            overlap_before = true;
+        }
+        pending = Some((start, end, overlap_before));
+    }
+    if let Some(region) = pending {
+        chunks.push(region);
+    }
+    chunks
+}
+
+fn pcm_to_wav(pcm: &[u8], sample_rate: u32, channels: u16) -> Result<Vec<u8>> {
+    let data_len = u32::try_from(pcm.len()).context("WAV chunk exceeds RIFF size")?;
+    let byte_rate = sample_rate * channels as u32 * 2;
+    let block_align = channels * 2;
+    let mut wav = Vec::with_capacity(44 + pcm.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&channels.to_le_bytes());
+    wav.extend_from_slice(&sample_rate.to_le_bytes());
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&block_align.to_le_bytes());
+    wav.extend_from_slice(&16_u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.extend_from_slice(pcm);
+    Ok(wav)
+}
+
+fn reconcile_chunks(chunks: Vec<TranscribedChunk>) -> Vec<NormalizedTranscript> {
+    let mut output: Vec<NormalizedTranscript> = Vec::new();
+    for mut chunk in chunks {
+        if chunk.overlap_before {
+            if let (Some(previous), Some(first)) = (output.last(), chunk.events.first_mut()) {
+                first.text = remove_repeated_prefix(&previous.text, &first.text);
+            }
+        }
+        output.extend(
+            chunk
+                .events
+                .into_iter()
+                .filter(|event| !event.text.trim().is_empty()),
+        );
+    }
+    output
+}
+
+fn remove_repeated_prefix(previous: &str, current: &str) -> String {
+    let previous_words = previous.split_whitespace().collect::<Vec<_>>();
+    let current_words = current.split_whitespace().collect::<Vec<_>>();
+    let max = previous_words.len().min(current_words.len()).min(16);
+    for count in (2..=max).rev() {
+        let left = &previous_words[previous_words.len() - count..];
+        let right = &current_words[..count];
+        if left
+            .iter()
+            .zip(right)
+            .all(|(a, b)| normalize_word(a) == normalize_word(b))
+        {
+            return current_words[count..].join(" ");
+        }
+    }
+    current.to_string()
+}
+
+fn normalize_word(word: &str) -> String {
+    word.chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 impl TranscriptionClient {
     async fn transcribe(
         &self,
@@ -460,6 +849,9 @@ impl TranscriptionClient {
             .part("file", part);
         if let Some(language) = &self.language {
             form = form.text("language", language.clone());
+        }
+        if let Some(prompt) = &self.prompt {
+            form = form.text("prompt", prompt.clone());
         }
         if diarization {
             form = form
@@ -586,6 +978,68 @@ mod tests {
                 channels: 1,
             }),
             ("chunk.ogg", "audio/ogg")
+        );
+    }
+
+    #[test]
+    fn vad_skips_silence_and_splits_long_speech_with_overlap() {
+        let sample_rate = 16_000_u32;
+        let mut pcm = vec![0_u8; sample_rate as usize * 2];
+        for _ in 0..(sample_rate as usize * 40) {
+            pcm.extend_from_slice(&2_000_i16.to_le_bytes());
+        }
+        pcm.resize(pcm.len() + sample_rate as usize * 2, 0);
+        let bytes = pcm_to_wav(&pcm, sample_rate, 1).unwrap();
+        let wav = parse_pcm_wav(&bytes).unwrap();
+        let chunks = vad_chunks(
+            &wav,
+            &SmartChunkConfig {
+                enabled: true,
+                concurrency: 2,
+                target_seconds: 25,
+                max_seconds: 28,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(chunks.len(), 2);
+        assert!(!chunks[0].overlap_before);
+        assert!(chunks[1].overlap_before);
+        assert!(chunks[0].start_ms < 1_000);
+        assert!(chunks[1].start_ms < chunks[0].end_ms);
+        assert!(chunks[1].end_ms > 40_000);
+        assert!(chunks.iter().all(|chunk| parse_pcm_wav(&chunk.wav).is_ok()));
+    }
+
+    #[test]
+    fn vad_does_not_submit_silence() {
+        let bytes = pcm_to_wav(&vec![0; 16_000 * 2 * 10], 16_000, 1).unwrap();
+        let wav = parse_pcm_wav(&bytes).unwrap();
+        let chunks = vad_chunks(
+            &wav,
+            &SmartChunkConfig {
+                enabled: true,
+                concurrency: 1,
+                target_seconds: 25,
+                max_seconds: 28,
+            },
+        )
+        .unwrap();
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn removes_only_repeated_overlap_prefix() {
+        assert_eq!(
+            remove_repeated_prefix(
+                "we should deploy this next week",
+                "this next week after the review"
+            ),
+            "after the review"
+        );
+        assert_eq!(
+            remove_repeated_prefix("the first topic", "the second topic"),
+            "the second topic"
         );
     }
 }

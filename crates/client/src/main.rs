@@ -57,6 +57,9 @@ struct CliArgs {
     #[arg(long, env = "WHISPER_RELAY_RECORDING_OUTPUT")]
     recording_output: Option<PathBuf>,
 
+    #[arg(long, env = "WHISPER_RELAY_EVENTS_OUTPUT")]
+    events_output: Option<PathBuf>,
+
     #[arg(long, env = "WHISPER_RELAY_OIDC_ISSUER")]
     oidc_issuer: Option<String>,
 
@@ -132,6 +135,7 @@ struct FileConfig {
     server_url: Option<String>,
     output: Option<PathBuf>,
     recording_output: Option<PathBuf>,
+    events_output: Option<PathBuf>,
     oidc_issuer: Option<String>,
     oidc_client_id: Option<String>,
     token: Option<String>,
@@ -153,6 +157,7 @@ struct ClientConfig {
     server_url: String,
     output: PathBuf,
     recording_output: Option<PathBuf>,
+    events_output: PathBuf,
     oidc_issuer: Option<String>,
     oidc_client_id: Option<String>,
     token: Option<String>,
@@ -364,6 +369,12 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("opening {}", config.output.display()))?;
     write_session_header(&mut output).await?;
+    let mut events_output = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&config.events_output)
+        .await
+        .with_context(|| format!("opening {}", config.events_output.display()))?;
 
     let audio_state = build_audio_state(&config, &logs).await?;
     let tui = if config.audio_file.is_none() {
@@ -391,7 +402,7 @@ async fn main() -> Result<()> {
             }
             message = ws.next() => {
                 match message {
-                    Some(Ok(Message::Text(text))) => handle_server_message(&mut output, &logs, &text).await?,
+                    Some(Ok(Message::Text(text))) => handle_server_message(&mut output, &mut events_output, &logs, &text).await?,
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(_)) => {}
                     Some(Err(err)) => return Err(err.into()),
@@ -412,7 +423,9 @@ async fn main() -> Result<()> {
 
     while let Some(message) = ws.next().await {
         match message {
-            Ok(Message::Text(text)) => handle_server_message(&mut output, &logs, &text).await?,
+            Ok(Message::Text(text)) => {
+                handle_server_message(&mut output, &mut events_output, &logs, &text).await?
+            }
             Ok(Message::Close(_)) => break,
             Ok(_) => {}
             Err(err) if is_expected_shutdown_ws_error(&err) => break,
@@ -431,20 +444,27 @@ async fn main() -> Result<()> {
 impl ClientConfig {
     fn load(args: CliArgs) -> Result<Self> {
         let file = load_file_config(args.config.as_ref())?;
+        let output = expand_home(
+            args.output
+                .or(file.output)
+                .unwrap_or_else(|| PathBuf::from("transcript.md")),
+        );
+        let events_output = args
+            .events_output
+            .or(file.events_output)
+            .map(expand_home)
+            .unwrap_or_else(|| output.with_extension("events.jsonl"));
         Ok(Self {
             server_url: args
                 .server_url
                 .or(file.server_url)
                 .unwrap_or_else(|| "ws://127.0.0.1:8080/v1/sessions/ws".into()),
-            output: expand_home(
-                args.output
-                    .or(file.output)
-                    .unwrap_or_else(|| PathBuf::from("transcript.md")),
-            ),
+            output,
             recording_output: args
                 .recording_output
                 .or(file.recording_output)
                 .map(expand_home),
+            events_output,
             oidc_issuer: args.oidc_issuer.or(file.oidc_issuer),
             oidc_client_id: args.oidc_client_id.or(file.oidc_client_id),
             token: args.token.or(file.token),
@@ -798,6 +818,7 @@ async fn push_log(logs: &SharedLogs, line: impl Into<String>) {
 
 async fn handle_server_message(
     output: &mut tokio::fs::File,
+    events_output: &mut tokio::fs::File,
     logs: &SharedLogs,
     text: &str,
 ) -> Result<()> {
@@ -812,6 +833,10 @@ async fn handle_server_message(
             )
             .await;
             append_transcript(output, &event).await?;
+            events_output
+                .write_all(format!("{}\n", serde_json::to_string(&event)?).as_bytes())
+                .await?;
+            events_output.flush().await?;
         }
         ServerMessage::TranscriptPartial(_) => {}
         ServerMessage::Warning(warning) => {
@@ -2007,6 +2032,7 @@ mod tests {
             server_url: None,
             output: None,
             recording_output: None,
+            events_output: None,
             oidc_issuer: None,
             oidc_client_id: None,
             token: None,
@@ -2025,6 +2051,10 @@ mod tests {
         .unwrap();
         assert_eq!(config.server_url, "ws://127.0.0.1:8080/v1/sessions/ws");
         assert_eq!(config.output, PathBuf::from("transcript.md"));
+        assert_eq!(
+            config.events_output,
+            PathBuf::from("transcript.events.jsonl")
+        );
         assert_eq!(config.chunk_seconds, 15);
         assert_eq!(config.capture_mode, CaptureMode::Meeting);
         assert!(!config.auto_enable_new_streams);
@@ -2054,6 +2084,7 @@ audio_rescan_seconds = 5
             server_url: None,
             output: None,
             recording_output: None,
+            events_output: None,
             oidc_issuer: None,
             oidc_client_id: None,
             token: None,
@@ -2090,6 +2121,7 @@ audio_rescan_seconds = 5
             server_url: "ws://127.0.0.1:8080/v1/sessions/ws".into(),
             output: PathBuf::from("transcript.md"),
             recording_output: None,
+            events_output: PathBuf::from("transcript.events.jsonl"),
             oidc_issuer: None,
             oidc_client_id: None,
             token: None,
