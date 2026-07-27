@@ -71,6 +71,16 @@ struct Args {
 
     #[arg(
         long,
+        env = "WHISPER_RELAY_TRANSCRIPTION_TIMEOUT_SECONDS",
+        default_value_t = 3600
+    )]
+    transcription_timeout_seconds: u64,
+
+    #[arg(long, env = "WHISPER_RELAY_MAX_AUDIO_MIB", default_value_t = 512)]
+    max_audio_mib: usize,
+
+    #[arg(
+        long,
         env = "WHISPER_RELAY_BACKEND_DIARIZATION",
         default_value_t = false
     )]
@@ -84,6 +94,7 @@ struct AppState {
     diarization: Option<TranscriptionClient>,
     chunk_seconds: u64,
     backend_diarization: bool,
+    max_audio_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -103,6 +114,7 @@ struct TranscriptionClient {
     api_key: Option<String>,
     model: String,
     language: Option<String>,
+    timeout: Duration,
 }
 
 #[derive(Debug, Deserialize)]
@@ -158,6 +170,7 @@ async fn main() -> Result<()> {
             api_key: args.transcription_api_key.clone(),
             model: args.transcription_model.clone(),
             language: args.language.clone(),
+            timeout: Duration::from_secs(args.transcription_timeout_seconds),
         },
         diarization: args
             .diarization_base_url
@@ -171,9 +184,11 @@ async fn main() -> Result<()> {
                     .clone()
                     .unwrap_or_else(|| "whisper-diarized".into()),
                 language: args.language.clone(),
+                timeout: Duration::from_secs(args.transcription_timeout_seconds),
             }),
         chunk_seconds: args.chunk_seconds,
         backend_diarization: args.backend_diarization,
+        max_audio_bytes: args.max_audio_mib * 1024 * 1024,
     });
 
     let app = Router::new()
@@ -236,12 +251,13 @@ async fn ws_handler(
         return (StatusCode::UNAUTHORIZED, err).into_response();
     }
 
-    ws.on_upgrade(move |socket| async move {
-        if let Err(err) = handle_socket(state, socket).await {
-            error!(%err, "session failed");
-        }
-    })
-    .into_response()
+    ws.max_message_size(state.max_audio_bytes)
+        .on_upgrade(move |socket| async move {
+            if let Err(err) = handle_socket(state, socket).await {
+                error!(%err, "session failed");
+            }
+        })
+        .into_response()
 }
 
 fn authorize(auth: &AuthConfig, headers: &HeaderMap) -> std::result::Result<(), String> {
@@ -458,7 +474,7 @@ impl TranscriptionClient {
             request = request.bearer_auth(api_key);
         }
 
-        let response = request.timeout(Duration::from_secs(120)).send().await?;
+        let response = request.timeout(self.timeout).send().await?;
         let status = response.status();
         let body = response.text().await?;
         if !status.is_success() {

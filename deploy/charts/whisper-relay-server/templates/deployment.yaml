@@ -81,6 +81,10 @@ spec:
             {{- end }}
             - name: WHISPER_RELAY_CHUNK_SECONDS
               value: {{ .Values.config.chunkSeconds | quote }}
+            - name: WHISPER_RELAY_TRANSCRIPTION_TIMEOUT_SECONDS
+              value: {{ .Values.config.transcriptionTimeoutSeconds | quote }}
+            - name: WHISPER_RELAY_MAX_AUDIO_MIB
+              value: {{ .Values.config.maxAudioMiB | quote }}
             - name: WHISPER_RELAY_BACKEND_DIARIZATION
               value: {{ .Values.config.backendDiarization | quote }}
             {{- if .Values.config.transcriptionApiKey }}

@@ -38,6 +38,10 @@ spec:
               value: http://litellm.litellm.svc.cluster.local:4000
             - name: WHISPER_RELAY_TRANSCRIPTION_MODEL
               value: whisper
+            - name: WHISPER_RELAY_TRANSCRIPTION_TIMEOUT_SECONDS
+              value: "3600"
+            - name: WHISPER_RELAY_MAX_AUDIO_MIB
+              value: "512"
             - name: WHISPER_RELAY_BACKEND_DIARIZATION
               value: "true"
             - name: WHISPER_RELAY_DIARIZATION_BASE_URL

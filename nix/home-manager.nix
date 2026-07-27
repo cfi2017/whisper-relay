@@ -30,10 +30,10 @@ in
       example = {
         server_url = "wss://whisper.example.com/v1/sessions/ws";
         output = "~/Documents/meetings/transcript.md";
+        capture_mode = "meeting";
         oidc_issuer = "https://issuer.example.com";
         oidc_client_id = "whisper-relay-device-client";
         diarization = "prefer";
-        chunk_seconds = 15;
         auto_enable_new_streams = true;
         audio_rescan_seconds = 2;
         source = [ "42" "84" ];

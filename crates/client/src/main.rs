@@ -54,6 +54,9 @@ struct CliArgs {
     #[arg(long, env = "WHISPER_RELAY_OUTPUT")]
     output: Option<PathBuf>,
 
+    #[arg(long, env = "WHISPER_RELAY_RECORDING_OUTPUT")]
+    recording_output: Option<PathBuf>,
+
     #[arg(long, env = "WHISPER_RELAY_OIDC_ISSUER")]
     oidc_issuer: Option<String>,
 
@@ -99,6 +102,9 @@ struct CliArgs {
     #[arg(long)]
     chunk_seconds: Option<u64>,
 
+    #[arg(long, value_enum)]
+    capture_mode: Option<CaptureMode>,
+
     #[arg(
         long,
         env = "WHISPER_RELAY_AUTO_ENABLE_NEW_STREAMS",
@@ -125,6 +131,7 @@ enum DiarizationArg {
 struct FileConfig {
     server_url: Option<String>,
     output: Option<PathBuf>,
+    recording_output: Option<PathBuf>,
     oidc_issuer: Option<String>,
     oidc_client_id: Option<String>,
     token: Option<String>,
@@ -136,6 +143,7 @@ struct FileConfig {
     #[serde(default)]
     source: Vec<String>,
     chunk_seconds: Option<u64>,
+    capture_mode: Option<CaptureMode>,
     auto_enable_new_streams: Option<bool>,
     audio_rescan_seconds: Option<u64>,
 }
@@ -144,6 +152,7 @@ struct FileConfig {
 struct ClientConfig {
     server_url: String,
     output: PathBuf,
+    recording_output: Option<PathBuf>,
     oidc_issuer: Option<String>,
     oidc_client_id: Option<String>,
     token: Option<String>,
@@ -154,8 +163,16 @@ struct ClientConfig {
     audio_file: Option<PathBuf>,
     source: Vec<String>,
     chunk_seconds: u64,
+    capture_mode: CaptureMode,
     auto_enable_new_streams: bool,
     audio_rescan_seconds: u64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum CaptureMode {
+    Meeting,
+    Live,
 }
 
 impl From<DiarizationArg> for DiarizationPreference {
@@ -253,6 +270,9 @@ struct AudioState {
     active_ids: Vec<String>,
     auto_enable_new_streams: bool,
     capture_status: String,
+    capture_mode: CaptureMode,
+    recording_requested: bool,
+    recording_started_at: Option<Instant>,
     quit_requested: bool,
 }
 
@@ -356,15 +376,6 @@ async fn main() -> Result<()> {
     loop {
         tokio::select! {
             chunk = audio.next_chunk() => {
-                if quit_requested(&audio_state).await {
-                    let audio_end = serde_json::to_string(&ClientMessage::AudioEnd)?;
-                    if let Err(err) = ws.send(Message::Text(audio_end.into())).await {
-                        if !is_expected_shutdown_ws_error(&err) {
-                            return Err(err.into());
-                        }
-                    }
-                    break;
-                }
                 let Some(chunk) = chunk? else {
                     let audio_end = serde_json::to_string(&ClientMessage::AudioEnd)?;
                     if let Err(err) = ws.send(Message::Text(audio_end.into())).await {
@@ -386,13 +397,7 @@ async fn main() -> Result<()> {
             }
             _ = tokio::signal::ctrl_c() => {
                 request_quit(&audio_state).await;
-                let audio_end = serde_json::to_string(&ClientMessage::AudioEnd)?;
-                if let Err(err) = ws.send(Message::Text(audio_end.into())).await {
-                    if !is_expected_shutdown_ws_error(&err) {
-                        return Err(err.into());
-                    }
-                }
-                break;
+                push_log(&logs, "stopping capture cleanly").await;
             }
         }
     }
@@ -428,6 +433,10 @@ impl ClientConfig {
                     .or(file.output)
                     .unwrap_or_else(|| PathBuf::from("transcript.md")),
             ),
+            recording_output: args
+                .recording_output
+                .or(file.recording_output)
+                .map(expand_home),
             oidc_issuer: args.oidc_issuer.or(file.oidc_issuer),
             oidc_client_id: args.oidc_client_id.or(file.oidc_client_id),
             token: args.token.or(file.token),
@@ -455,6 +464,10 @@ impl ClientConfig {
                 args.source
             },
             chunk_seconds: args.chunk_seconds.or(file.chunk_seconds).unwrap_or(15),
+            capture_mode: args
+                .capture_mode
+                .or(file.capture_mode)
+                .unwrap_or(CaptureMode::Meeting),
             auto_enable_new_streams: args
                 .auto_enable_new_streams
                 .or(file.auto_enable_new_streams)
@@ -757,16 +770,12 @@ async fn build_audio_state(
         active_ids: Vec::new(),
         auto_enable_new_streams: config.auto_enable_new_streams,
         capture_status: "starting".into(),
+        capture_mode: config.capture_mode,
+        recording_requested: config.capture_mode == CaptureMode::Live,
+        recording_started_at: None,
         quit_requested: false,
     };
     Ok(Some(Arc::new(RwLock::new(state))))
-}
-
-async fn quit_requested(state: &Option<SharedAudioState>) -> bool {
-    let Some(state) = state else {
-        return false;
-    };
-    state.read().await.quit_requested
 }
 
 async fn request_quit(state: &Option<SharedAudioState>) {
@@ -862,6 +871,20 @@ fn format_ms(ms: u64) -> String {
 enum AudioInput {
     File(Option<PathBuf>),
     Live(Box<LiveCapture>),
+    Meeting(Box<MeetingCapture>),
+}
+
+struct MeetingCapture {
+    active_ids: Vec<String>,
+    child: Option<tokio::process::Child>,
+    dir: tempfile::TempDir,
+    segment_paths: Vec<PathBuf>,
+    recording_output: PathBuf,
+    audio_rescan_interval: Duration,
+    last_rescan: Instant,
+    state: SharedAudioState,
+    logs: SharedLogs,
+    finished: bool,
 }
 
 struct LiveCapture {
@@ -889,6 +912,23 @@ impl AudioInput {
             return Ok(Self::File(Some(path.clone())));
         }
         let state = audio_state.context("live capture requires audio state")?;
+
+        if config.capture_mode == CaptureMode::Meeting {
+            return Ok(Self::Meeting(Box::new(MeetingCapture {
+                active_ids: Vec::new(),
+                child: None,
+                dir: tempfile::tempdir()?,
+                segment_paths: Vec::new(),
+                recording_output: meeting_audio_path(config),
+                audio_rescan_interval: Duration::from_secs(config.audio_rescan_seconds.max(1)),
+                last_rescan: Instant::now()
+                    .checked_sub(Duration::from_secs(config.audio_rescan_seconds.max(1)))
+                    .unwrap_or_else(Instant::now),
+                state,
+                logs,
+                finished: false,
+            })));
+        }
 
         let dir = tempfile::tempdir()?;
         let location_pattern = dir.path().join("chunk-%05d.wav").display().to_string();
@@ -921,6 +961,190 @@ impl AudioInput {
                 Ok(Some(tokio::fs::read(path).await?))
             }
             Self::Live(capture) => capture.next_chunk().await,
+            Self::Meeting(capture) => capture.next_audio().await,
+        }
+    }
+}
+
+impl MeetingCapture {
+    async fn next_audio(&mut self) -> Result<Option<Vec<u8>>> {
+        loop {
+            if self.finished {
+                return Ok(None);
+            }
+            if self.last_rescan.elapsed() >= self.audio_rescan_interval {
+                self.refresh_sources().await?;
+            }
+
+            let (recording_requested, quit_requested) = {
+                let state = self.state.read().await;
+                (state.recording_requested, state.quit_requested)
+            };
+            if !recording_requested && !self.segment_paths.is_empty() {
+                return self.finish().await.map(Some);
+            }
+            if quit_requested {
+                if self.child.is_some() || !self.segment_paths.is_empty() {
+                    return self.finish().await.map(Some);
+                }
+                self.finished = true;
+                return Ok(None);
+            }
+
+            if let Some(reason) = self.child_exit_reason().await? {
+                self.log(format!("meeting recorder exited unexpectedly ({reason})"))
+                    .await;
+                self.start_segment().await?;
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    async fn refresh_sources(&mut self) -> Result<()> {
+        self.last_rescan = Instant::now();
+        let sources = discover_sources().await?;
+        let (selected_keys, recording_requested) = {
+            let mut state = self.state.write().await;
+            state.sources = sources;
+            if state.auto_enable_new_streams {
+                let keys = state
+                    .sources
+                    .iter()
+                    .map(AudioSource::identity_key)
+                    .collect::<Vec<_>>();
+                state.selected_keys.extend(keys);
+            }
+            (state.selected_keys.clone(), state.recording_requested)
+        };
+        let sources = self.state.read().await.sources.clone();
+        let active_ids = sources
+            .iter()
+            .filter(|source| {
+                selected_keys
+                    .iter()
+                    .any(|key| source.matches_configured(key))
+            })
+            .map(|source| source.id.clone())
+            .collect::<Vec<_>>();
+
+        if active_ids != self.active_ids {
+            if self.child.is_some() {
+                self.finalize_segment().await?;
+            }
+            self.active_ids = active_ids;
+            if recording_requested {
+                self.start_segment().await?;
+            }
+        } else if recording_requested && self.child.is_none() {
+            self.start_segment().await?;
+        }
+
+        let mut state = self.state.write().await;
+        state.active_ids = self.active_ids.clone();
+        if !recording_requested {
+            state.capture_status = "ready; press r to record".into();
+        } else if self.active_ids.is_empty() {
+            state.capture_status = "recording; waiting for selected streams".into();
+        } else {
+            state.capture_status = format!("recording {} stream(s)", self.active_ids.len());
+        }
+        Ok(())
+    }
+
+    async fn start_segment(&mut self) -> Result<()> {
+        if self.child.is_some() || self.active_ids.is_empty() {
+            return Ok(());
+        }
+        let path = self
+            .dir
+            .path()
+            .join(format!("meeting-{:05}.wav", self.segment_paths.len()));
+        self.child = Some(spawn_meeting_gstreamer(
+            &self.active_ids,
+            &path.display().to_string(),
+        )?);
+        self.segment_paths.push(path);
+        self.log(format!(
+            "recording meeting from {} stream(s)",
+            self.active_ids.len()
+        ))
+        .await;
+        Ok(())
+    }
+
+    async fn finalize_segment(&mut self) -> Result<()> {
+        let Some(mut child) = self.child.take() else {
+            return Ok(());
+        };
+        if let Some(id) = child.id() {
+            let status = Command::new("kill")
+                .args(["-INT", &id.to_string()])
+                .status()
+                .await?;
+            if !status.success() {
+                child.start_kill()?;
+            }
+        }
+        let status = child.wait().await?;
+        if !status.success() {
+            self.log(format!("meeting recorder finalized with {status}"))
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn child_exit_reason(&mut self) -> Result<Option<String>> {
+        let Some(child) = &mut self.child else {
+            return Ok(None);
+        };
+        let Some(status) = child.try_wait()? else {
+            return Ok(None);
+        };
+        self.child = None;
+        Ok(Some(status.to_string()))
+    }
+
+    async fn finish(&mut self) -> Result<Vec<u8>> {
+        self.finalize_segment().await?;
+        {
+            let mut state = self.state.write().await;
+            state.capture_status = "preparing full meeting upload".into();
+            state.active_ids.clear();
+        }
+        let bytes = merge_wav_segments(&self.segment_paths).await?;
+        if let Some(parent) = self
+            .recording_output
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).await?;
+        }
+        fs::write(&self.recording_output, &bytes)
+            .await
+            .with_context(|| format!("writing {}", self.recording_output.display()))?;
+        self.log(format!(
+            "saved recording to {}",
+            self.recording_output.display()
+        ))
+        .await;
+        self.log(format!(
+            "uploading full meeting ({} MiB)",
+            bytes.len() / 1_048_576
+        ))
+        .await;
+        self.finished = true;
+        Ok(bytes)
+    }
+
+    async fn log(&self, line: impl Into<String>) {
+        push_log(&self.logs, line).await;
+    }
+}
+
+impl Drop for MeetingCapture {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
         }
     }
 }
@@ -1241,6 +1465,23 @@ fn spawn_tui(state: Option<SharedAudioState>, logs: SharedLogs) -> JoinHandle<Re
                         )
                         .await;
                     }
+                    KeyCode::Char('r') if snapshot.capture_mode == CaptureMode::Meeting => {
+                        let mut state = state.write().await;
+                        if state.recording_requested {
+                            state.recording_requested = false;
+                            state.recording_started_at = None;
+                            state.capture_status = "finalizing meeting".into();
+                            push_log(&logs, "stopping recording; full transcription will start")
+                                .await;
+                        } else if !state.selected_keys.is_empty() {
+                            state.recording_requested = true;
+                            state.recording_started_at = Some(Instant::now());
+                            push_log(&logs, "meeting recording started").await;
+                        } else {
+                            push_log(&logs, "select at least one audio stream before recording")
+                                .await;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1281,10 +1522,11 @@ impl TuiSession {
                 .split(frame.area());
 
             let header = Paragraph::new(format!(
-                "Whisper Relay | {} | active {} | auto-enable {}",
+                "Whisper Relay | {} | active {} | auto-enable {}{}",
                 state.capture_status,
                 state.active_ids.len(),
-                state.auto_enable_new_streams
+                state.auto_enable_new_streams,
+                state.recording_started_at.map(|started| format!(" | {}", format_duration(started.elapsed()))).unwrap_or_default()
             ))
             .block(Block::default().borders(Borders::ALL).title("Client"));
             frame.render_widget(header, outer[0]);
@@ -1341,7 +1583,12 @@ impl TuiSession {
                 .block(Block::default().borders(Borders::ALL).title("Log"));
             frame.render_widget(log_panel, columns[1]);
 
-            let help = Paragraph::new("Up/Down or j/k move  Space toggles stream  a toggles auto-enable  q/Esc quits  App playback = people you hear  Microphone = you")
+            let help_text = if state.capture_mode == CaptureMode::Meeting {
+                "r starts/stops meeting  Space toggles stream  a toggles auto-enable  q/Esc stops and transcribes  App playback = people you hear  Microphone = you"
+            } else {
+                "Space toggles stream  a toggles auto-enable  q/Esc quits  App playback = people you hear  Microphone = you"
+            };
+            let help = Paragraph::new(help_text)
             .wrap(Wrap { trim: true })
             .block(Block::default().borders(Borders::ALL).title("Keys"));
             frame.render_widget(help, outer[2]);
@@ -1495,6 +1742,22 @@ fn gstreamer_args(sources: &[String], location: &str, chunk_seconds: u64) -> Vec
         "INT".into(),
         chunk_seconds.to_string(),
         "gst-launch-1.0".into(),
+    ];
+    args.extend(gstreamer_pipeline_args(sources, location));
+    args
+}
+
+fn spawn_meeting_gstreamer(sources: &[String], location: &str) -> Result<tokio::process::Child> {
+    Command::new("gst-launch-1.0")
+        .args(gstreamer_pipeline_args(sources, location))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("starting gst-launch-1.0 meeting recorder")
+}
+
+fn gstreamer_pipeline_args(sources: &[String], location: &str) -> Vec<String> {
+    let mut args = vec![
         "-e".into(),
         "-q".into(),
         "audiomixer".into(),
@@ -1511,7 +1774,6 @@ fn gstreamer_args(sources: &[String], location: &str, chunk_seconds: u64) -> Vec
         "filesink".into(),
         format!("location={location}"),
     ];
-
     for source in sources {
         args.extend([
             "pipewiresrc".into(),
@@ -1524,8 +1786,82 @@ fn gstreamer_args(sources: &[String], location: &str, chunk_seconds: u64) -> Vec
             "mixer.".into(),
         ]);
     }
-
     args
+}
+
+async fn merge_wav_segments(paths: &[PathBuf]) -> Result<Vec<u8>> {
+    let mut pcm = Vec::new();
+    for path in paths {
+        let wav = fs::read(path)
+            .await
+            .with_context(|| format!("reading {}", path.display()))?;
+        pcm.extend_from_slice(wav_pcm_data(&wav)?);
+    }
+    if pcm.is_empty() {
+        bail!("meeting recording contained no audio");
+    }
+    Ok(wav_with_pcm(&pcm))
+}
+
+fn wav_pcm_data(wav: &[u8]) -> Result<&[u8]> {
+    if wav.len() < 12 || &wav[0..4] != b"RIFF" || &wav[8..12] != b"WAVE" {
+        bail!("recorder produced an invalid WAV file");
+    }
+    let mut offset = 12;
+    while offset + 8 <= wav.len() {
+        let size = u32::from_le_bytes(wav[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        let start = offset + 8;
+        let end = start.saturating_add(size);
+        if end > wav.len() {
+            break;
+        }
+        if &wav[offset..offset + 4] == b"data" {
+            return Ok(&wav[start..end]);
+        }
+        offset = end + (size % 2);
+    }
+    bail!("recorder WAV file has no audio data")
+}
+
+fn wav_with_pcm(pcm: &[u8]) -> Vec<u8> {
+    let data_len = u32::try_from(pcm.len()).unwrap_or(u32::MAX);
+    let mut wav = Vec::with_capacity(44 + pcm.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&16_000_u32.to_le_bytes());
+    wav.extend_from_slice(&32_000_u32.to_le_bytes());
+    wav.extend_from_slice(&2_u16.to_le_bytes());
+    wav.extend_from_slice(&16_u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.extend_from_slice(&pcm[..data_len as usize]);
+    wav
+}
+
+fn format_duration(duration: Duration) -> String {
+    format!(
+        "{:02}:{:02}:{:02}",
+        duration.as_secs() / 3600,
+        (duration.as_secs() % 3600) / 60,
+        duration.as_secs() % 60
+    )
+}
+
+fn meeting_audio_path(config: &ClientConfig) -> PathBuf {
+    if let Some(path) = &config.recording_output {
+        return path.clone();
+    }
+    let stem = config
+        .output
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("meeting");
+    let name = format!("{stem}-{}.wav", Utc::now().format("%Y%m%d-%H%M%S"));
+    config.output.with_file_name(name)
 }
 
 fn hostname() -> String {
@@ -1539,6 +1875,32 @@ mod tests {
     #[test]
     fn formats_offsets() {
         assert_eq!(format_ms(3_723_000), "01:02:03");
+    }
+
+    #[test]
+    fn merges_pcm_from_finalized_wav_segments() {
+        let first = wav_with_pcm(&[1, 2, 3, 4]);
+        let second = wav_with_pcm(&[5, 6, 7, 8]);
+        let mut combined = Vec::new();
+        combined.extend_from_slice(wav_pcm_data(&first).unwrap());
+        combined.extend_from_slice(wav_pcm_data(&second).unwrap());
+        let merged = wav_with_pcm(&combined);
+
+        assert_eq!(wav_pcm_data(&merged).unwrap(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(u32::from_le_bytes(merged[40..44].try_into().unwrap()), 8);
+    }
+
+    #[test]
+    fn default_meeting_audio_path_is_timestamped_beside_transcript() {
+        let config = test_config();
+        let path = meeting_audio_path(&config);
+        assert_eq!(path.parent(), config.output.parent());
+        assert!(path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("transcript-"));
+        assert_eq!(path.extension().unwrap(), "wav");
     }
 
     #[test]
@@ -1636,6 +1998,7 @@ mod tests {
             config: Some(dir.path().join("missing.toml")),
             server_url: None,
             output: None,
+            recording_output: None,
             oidc_issuer: None,
             oidc_client_id: None,
             token: None,
@@ -1647,6 +2010,7 @@ mod tests {
             source: Vec::new(),
             list_sources: false,
             chunk_seconds: None,
+            capture_mode: None,
             auto_enable_new_streams: None,
             audio_rescan_seconds: None,
         })
@@ -1654,6 +2018,7 @@ mod tests {
         assert_eq!(config.server_url, "ws://127.0.0.1:8080/v1/sessions/ws");
         assert_eq!(config.output, PathBuf::from("transcript.md"));
         assert_eq!(config.chunk_seconds, 15);
+        assert_eq!(config.capture_mode, CaptureMode::Meeting);
         assert!(!config.auto_enable_new_streams);
         assert_eq!(config.audio_rescan_seconds, 2);
     }
@@ -1680,6 +2045,7 @@ audio_rescan_seconds = 5
             config: Some(path),
             server_url: None,
             output: None,
+            recording_output: None,
             oidc_issuer: None,
             oidc_client_id: None,
             token: None,
@@ -1691,6 +2057,7 @@ audio_rescan_seconds = 5
             source: Vec::new(),
             list_sources: false,
             chunk_seconds: None,
+            capture_mode: None,
             auto_enable_new_streams: None,
             audio_rescan_seconds: None,
         })
@@ -1714,6 +2081,7 @@ audio_rescan_seconds = 5
         ClientConfig {
             server_url: "ws://127.0.0.1:8080/v1/sessions/ws".into(),
             output: PathBuf::from("transcript.md"),
+            recording_output: None,
             oidc_issuer: None,
             oidc_client_id: None,
             token: None,
@@ -1724,6 +2092,7 @@ audio_rescan_seconds = 5
             audio_file: None,
             source: Vec::new(),
             chunk_seconds: 15,
+            capture_mode: CaptureMode::Meeting,
             auto_enable_new_streams: false,
             audio_rescan_seconds: 2,
         }

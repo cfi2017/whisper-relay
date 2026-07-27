@@ -1,10 +1,10 @@
 # Whisper Relay
 
-Whisper Relay is a greenfield Rust project for live meeting transcription with local audio capture and remote GPU-backed Whisper inference.
+Whisper Relay is a Rust project for full-meeting and live transcription with local audio capture and remote GPU-backed Whisper inference.
 
 ## Components
 
-- `whisper-relay-client`: Linux/PipeWire terminal client. It opens a TUI source picker by default, starts a GStreamer capture pipeline, sends short Ogg/Opus chunks over WebSocket, and appends transcripts to Markdown.
+- `whisper-relay-client`: Linux/PipeWire terminal client. It opens a TUI source picker, records selected streams into one meeting, sends the finalized WAV over WebSocket, and writes the transcript to Markdown.
 - `whisper-relay-server`: Kubernetes-ready Rust server. It validates OIDC bearer tokens, accepts WebSocket audio sessions, calls an OpenAI-compatible transcription endpoint, and returns normalized transcript events.
 - `whisper-relay-protocol`: Shared JSON protocol types.
 
@@ -29,7 +29,7 @@ cargo run -p whisper-relay-client -- \
   --output transcript.md
 ```
 
-For live capture:
+For full-meeting transcription:
 
 ```sh
 cargo run -p whisper-relay-client -- --list-sources
@@ -37,7 +37,11 @@ cargo run -p whisper-relay-client -- --output transcript.md
 cargo run -p whisper-relay-client -- --source <pipewire-node-id> --output transcript.md
 ```
 
-During live capture the TUI stays open. Use Space to enable or disable the highlighted stream while capture is running, `a` to toggle auto-enabling newly discovered streams, and `q`/Esc to stop. Stream marks are `[ ]` disabled, `[x]` selected but not currently active, and `[*]` selected and active in the capture pipeline.
+Select the application playback stream for the people you hear and your microphone for your own voice, then press `r` to start recording. Press `r` again to stop, save the meeting WAV, upload it once, and transcribe the complete recording. `q`, Esc, and Ctrl-C also stop and transcribe an active recording cleanly.
+
+The TUI stays open while recording and while the server transcribes. Use Space to enable or disable the highlighted stream and `a` to toggle auto-enabling newly discovered streams. When streams appear, disappear, or are toggled, the recorder creates a new local segment; it merges all segments into one WAV before upload, so the backend never sees transcription chunks. By default the recording is saved next to the Markdown output as `transcript-YYYYMMDD-HHMMSS.wav`.
+
+The previous low-latency behavior remains available with `--capture-mode live` or `capture_mode = "live"`. It sends finalized WAV chunks every `chunk_seconds`.
 
 ## Client Config
 
@@ -48,6 +52,9 @@ Use `--list-sources` to print current PipeWire node IDs and identity keys.
 ```toml
 server_url = "wss://whisper.example.com/v1/sessions/ws"
 output = "~/Documents/meetings/transcript.md"
+capture_mode = "meeting"
+# Optional fixed path. When omitted, a timestamped WAV is written beside output.
+# recording_output = "~/Documents/meetings/meeting.wav"
 oidc_issuer = "https://issuer.example.com"
 oidc_client_id = "whisper-relay-device-client"
 token_cache = "~/.cache/whisper-relay/oidc-token.json"
@@ -80,11 +87,11 @@ The flake exposes `homeManagerModules.default` and `homeManagerModules.whisper-r
             settings = {
               server_url = "wss://whisper.example.com/v1/sessions/ws";
               output = "~/Documents/meetings/transcript.md";
+              capture_mode = "meeting";
               oidc_issuer = "https://issuer.example.com";
               oidc_client_id = "whisper-relay-device-client";
               token_cache = "~/.cache/whisper-relay/oidc-token.json";
               diarization = "prefer";
-              chunk_seconds = 15;
               auto_enable_new_streams = true;
               audio_rescan_seconds = 2;
             };
@@ -157,6 +164,7 @@ The diarized backend must expose `/v1/audio/transcriptions` and return JSON cont
 ## Current V1 Boundaries
 
 - The transport is WebSocket for both control and audio.
-- Audio is not persisted by the server.
+- Audio is persisted only by the client; the server holds the uploaded meeting in memory while forwarding it to the transcription backend.
 - Diarization is requested from the transcription backend when enabled. If the backend does not return diarized segments, the client writes transcript lines with `Unknown`.
-- PipeWire capture is implemented through `pw-dump` and `gst-launch-1.0`; live capture writes temporary local Ogg/Opus chunks, sends each completed chunk, and deletes it.
+- Full-meeting mode records 16 kHz mono PCM and sends one WAV after recording stops. This is roughly 115 MiB per hour; configure `config.maxAudioMiB` and upstream Gateway/proxy request limits for longer meetings.
+- PipeWire capture is implemented through `pw-dump` and `gst-launch-1.0`. Live mode remains available for lower latency, but full-meeting mode is the default while capture and model quality are being validated.

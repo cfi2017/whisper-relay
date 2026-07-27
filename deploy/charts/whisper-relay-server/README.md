@@ -43,3 +43,5 @@ helm upgrade --install whisper-relay-server deploy/charts/whisper-relay-server \
 ```
 
 The route forwards all paths by default, including `/healthz` and `/v1/sessions/ws`.
+
+Full-meeting uploads default to a 512 MiB WebSocket message limit and a one-hour backend timeout. Adjust `config.maxAudioMiB` and `config.transcriptionTimeoutSeconds` for longer recordings, and apply matching limits to the Gateway implementation in front of the chart.
