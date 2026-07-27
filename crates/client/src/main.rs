@@ -372,6 +372,8 @@ async fn main() -> Result<()> {
         None
     };
     let mut audio = AudioInput::open(&config, audio_state.clone(), logs.clone()).await?;
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
@@ -394,6 +396,12 @@ async fn main() -> Result<()> {
                     Some(Ok(_)) => {}
                     Some(Err(err)) => return Err(err.into()),
                 }
+            }
+            _ = heartbeat.tick() => {
+                let ping = ClientMessage::Ping {
+                    nonce: Utc::now().timestamp_millis().to_string(),
+                };
+                ws.send(Message::Text(serde_json::to_string(&ping)?.into())).await?;
             }
             _ = tokio::signal::ctrl_c() => {
                 request_quit(&audio_state).await;
