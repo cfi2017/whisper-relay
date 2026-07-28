@@ -1,3 +1,10 @@
+## [1.9.2](https://github.com/cfi2017/whisper-relay/compare/v1.9.1...v1.9.2) (2026-07-28)
+
+
+### Bug Fixes
+
+* **observability:** diagnose meeting upload resets ([7aeab95](https://github.com/cfi2017/whisper-relay/commit/7aeab95921dedfe8add3c8b1a820e1f88cefd07d))
+
 ## [1.9.1](https://github.com/cfi2017/whisper-relay/compare/v1.9.0...v1.9.1) (2026-07-28)
 
 
