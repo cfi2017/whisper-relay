@@ -2400,7 +2400,7 @@ dependencies = [
 
 [[package]]
 name = "whisper-relay-client"
-version = "1.9.4"
+version = "1.9.5"
 dependencies = [
  "anyhow",
  "base64",
@@ -2424,7 +2424,7 @@ dependencies = [
 
 [[package]]
 name = "whisper-relay-protocol"
-version = "1.9.4"
+version = "1.9.5"
 dependencies = [
  "chrono",
  "serde",
@@ -2434,7 +2434,7 @@ dependencies = [
 
 [[package]]
 name = "whisper-relay-server"
-version = "1.9.4"
+version = "1.9.5"
 dependencies = [
  "anyhow",
  "axum",

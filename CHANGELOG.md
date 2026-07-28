@@ -1,3 +1,10 @@
+## [1.9.5](https://github.com/cfi2017/whisper-relay/compare/v1.9.4...v1.9.5) (2026-07-28)
+
+
+### Bug Fixes
+
+* **server:** share backend credentials with diarization ([db72748](https://github.com/cfi2017/whisper-relay/commit/db727483a84d4111a38c105e4bca58a814eeda94))
+
 ## [1.9.4](https://github.com/cfi2017/whisper-relay/compare/v1.9.3...v1.9.4) (2026-07-28)
 
 
