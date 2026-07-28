@@ -193,6 +193,13 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    let diarization_api_key = args
+        .diarization_api_key
+        .clone()
+        .or_else(|| args.transcription_api_key.clone());
+    let diarization_auth_inherited = args.diarization_api_key.is_none()
+        && args.transcription_api_key.is_some()
+        && args.diarization_base_url.is_some();
     let state = Arc::new(AppState {
         auth: build_auth(&args).await?,
         transcription: TranscriptionClient {
@@ -214,7 +221,7 @@ async fn main() -> Result<()> {
             .map(|base_url| TranscriptionClient {
                 http: reqwest::Client::new(),
                 base_url: base_url.trim_end_matches('/').to_string(),
-                api_key: args.diarization_api_key.clone(),
+                api_key: diarization_api_key.clone(),
                 model: args
                     .diarization_model
                     .clone()
@@ -247,7 +254,8 @@ async fn main() -> Result<()> {
         version = env!("CARGO_PKG_VERSION"),
         protocol_version = PROTOCOL_VERSION,
         transcription_auth = args.transcription_api_key.is_some(),
-        diarization_auth = args.diarization_api_key.is_some(),
+        diarization_auth = args.diarization_base_url.is_some() && diarization_api_key.is_some(),
+        diarization_auth_inherited,
         "listening"
     );
     axum::serve(listener, app).await?;

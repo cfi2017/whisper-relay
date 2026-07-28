@@ -166,6 +166,8 @@ config:
 
 or set `WHISPER_RELAY_BACKEND_DIARIZATION=true`, `WHISPER_RELAY_DIARIZATION_BASE_URL`, `WHISPER_RELAY_DIARIZATION_MODEL`, and `WHISPER_RELAY_DIARIZATION_RESPONSE_FORMAT=verbose_json` on the server. The relay then sends diarized requests to that backend and plain requests to `transcriptionBaseUrl`.
 
+The diarization client inherits `WHISPER_RELAY_TRANSCRIPTION_API_KEY` when `WHISPER_RELAY_DIARIZATION_API_KEY` is unset. Set the latter only when the diarization backend uses different credentials.
+
 The diarized backend must expose `/v1/audio/transcriptions` and return JSON containing segment `speaker` fields. Reference wiring lives in:
 
 - `deploy/reference/vllm-qwen3-asr.yaml`: vLLM Qwen3-ASR deployment.
