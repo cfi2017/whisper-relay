@@ -30,11 +30,11 @@ jobs:
       version: ${{ steps.semantic.outputs.new_release_version }}
       git-tag: ${{ steps.semantic.outputs.new_release_git_tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 24
 
@@ -50,18 +50,24 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  publish-server-image:
-    runs-on: ubuntu-latest
+  build-server-images:
     needs: semantic-release
     if: needs.semantic-release.outputs.published == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ needs.semantic-release.outputs.git-tag }}
 
       - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/setup-qemu-action@v3
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -70,22 +76,71 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and publish release image
+      - name: Build and publish ${{ matrix.arch }} image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/${{ matrix.arch }}
           push: true
-          tags: |
-            ${{ env.IMAGE_NAME }}:${{ needs.semantic-release.outputs.version }}
-            ${{ env.IMAGE_NAME }}:latest
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ needs.semantic-release.outputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=server-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=server-${{ matrix.arch }}
+
+      - name: Export image digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-server-image:
+    runs-on: ubuntu-latest
+    needs:
+      - semantic-release
+      - build-server-images
+    if: needs.semantic-release.outputs.published == 'true'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: server-digest-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish multi-platform manifest
+        working-directory: /tmp/digests
+        run: |
+          images=()
+          for digest in *; do
+            images+=("${IMAGE_NAME}@sha256:${digest}")
+          done
+          docker buildx imagetools create \
+            --tag "${IMAGE_NAME}:${{ needs.semantic-release.outputs.version }}" \
+            --tag "${IMAGE_NAME}:latest" \
+            "${images[@]}"
+
+      - name: Inspect published manifest
+        run: docker buildx imagetools inspect "${IMAGE_NAME}:${{ needs.semantic-release.outputs.version }}"
 
   publish-chart:
     runs-on: ubuntu-latest
@@ -94,7 +149,7 @@ jobs:
       - publish-server-image
     if: needs.semantic-release.outputs.published == 'true'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ needs.semantic-release.outputs.git-tag }}
 
