@@ -1,3 +1,10 @@
+## [1.8.1](https://github.com/cfi2017/whisper-relay/compare/v1.8.0...v1.8.1) (2026-07-28)
+
+
+### Bug Fixes
+
+* **release:** update lockfile during version bump ([389d0a8](https://github.com/cfi2017/whisper-relay/commit/389d0a824ce358dc53f2f434deebd1c00866cd1c))
+
 # [1.8.0](https://github.com/cfi2017/whisper-relay/compare/v1.7.1...v1.8.0) (2026-07-28)
 
 
