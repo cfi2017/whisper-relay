@@ -1,3 +1,10 @@
+## [1.9.4](https://github.com/cfi2017/whisper-relay/compare/v1.9.3...v1.9.4) (2026-07-28)
+
+
+### Bug Fixes
+
+* **chart:** require configured transcription secrets ([e2250b8](https://github.com/cfi2017/whisper-relay/commit/e2250b8a1fe0e30ff6652dcf3c4b1cc517ae93a7))
+
 ## [1.9.3](https://github.com/cfi2017/whisper-relay/compare/v1.9.2...v1.9.3) (2026-07-28)
 
 
