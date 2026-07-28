@@ -246,6 +246,8 @@ async fn main() -> Result<()> {
         addr = %args.bind,
         version = env!("CARGO_PKG_VERSION"),
         protocol_version = PROTOCOL_VERSION,
+        transcription_auth = args.transcription_api_key.is_some(),
+        diarization_auth = args.diarization_api_key.is_some(),
         "listening"
     );
     axum::serve(listener, app).await?;

@@ -51,7 +51,7 @@ spec:
               value: {{ .Values.config.oidcIssuer | quote }}
             - name: WHISPER_RELAY_OIDC_AUDIENCE
               value: {{ required "config.oidcAudience is required when config.oidcIssuer is set" .Values.config.oidcAudience | quote }}
-            {{- else }}
+            {{- else if or .Values.config.transcriptionApiKeySecret.name (and .Values.secrets.create .Values.secrets.transcription.apiKey) }}
             - name: WHISPER_RELAY_OIDC_ISSUER
               valueFrom:
                 secretKeyRef:

@@ -14,6 +14,18 @@ helm upgrade --install whisper-relay-server deploy/charts/whisper-relay-server \
   --set config.transcriptionBaseUrl=http://litellm.litellm.svc.cluster.local:4000
 ```
 
+For a LiteLLM API key stored in an existing Secret, configure its exact name and key:
+
+```yaml
+config:
+  transcriptionApiKeySecret:
+    name: litellm-api-key
+    key: api-key
+    optional: false
+```
+
+Secret-backed environment variables are read when the pod starts. Restart the deployment after changing the Secret. At startup, the server logs `transcription_auth=true` when the key is available, without logging its value.
+
 ## Diarization backend
 
 To route speaker-label requests to a separate OpenAI-compatible backend while keeping plain ASR on the default transcription backend:

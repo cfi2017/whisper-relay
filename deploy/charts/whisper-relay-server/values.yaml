@@ -51,7 +51,7 @@ config:
   transcriptionApiKeySecret:
     name: ""
     key: api-key
-    optional: true
+    optional: false
   language: ""
   prompt: ""
   chunkSeconds: 15
