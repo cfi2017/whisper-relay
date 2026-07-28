@@ -384,6 +384,8 @@ async fn main() -> Result<()> {
         None
     };
     let mut audio = AudioInput::open(&config, audio_state.clone(), logs.clone()).await?;
+    let headless = config.audio_file.is_some();
+    let mut transcript_count = 0_u64;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -403,7 +405,18 @@ async fn main() -> Result<()> {
             }
             message = ws.next() => {
                 match message {
-                    Some(Ok(Message::Text(text))) => handle_server_message(&mut output, &mut events_output, &logs, &text).await?,
+                    Some(Ok(Message::Text(text))) => {
+                        transcript_count += u64::from(
+                            handle_server_message(
+                                &mut output,
+                                &mut events_output,
+                                &logs,
+                                &text,
+                                headless,
+                            )
+                            .await?,
+                        );
+                    }
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(_)) => {}
                     Some(Err(err)) => return Err(err.into()),
@@ -425,7 +438,10 @@ async fn main() -> Result<()> {
     while let Some(message) = ws.next().await {
         match message {
             Ok(Message::Text(text)) => {
-                handle_server_message(&mut output, &mut events_output, &logs, &text).await?
+                transcript_count += u64::from(
+                    handle_server_message(&mut output, &mut events_output, &logs, &text, headless)
+                        .await?,
+                );
             }
             Ok(Message::Close(_)) => break,
             Ok(_) => {}
@@ -437,6 +453,10 @@ async fn main() -> Result<()> {
     if let Some(tui) = tui {
         request_quit(&audio_state).await;
         let _ = tui.await;
+    }
+
+    if headless && transcript_count == 0 {
+        bail!("server returned no transcript events; see the server messages above");
     }
 
     Ok(())
@@ -822,10 +842,15 @@ async fn handle_server_message(
     events_output: &mut tokio::fs::File,
     logs: &SharedLogs,
     text: &str,
-) -> Result<()> {
+    headless: bool,
+) -> Result<bool> {
     match serde_json::from_str::<ServerMessage>(text)? {
         ServerMessage::SessionReady(ready) => {
-            push_log(logs, format!("session ready {}", ready.session_id)).await;
+            let message = format!("session ready {}", ready.session_id);
+            push_log(logs, &message).await;
+            if headless {
+                eprintln!("{message}");
+            }
         }
         ServerMessage::TranscriptFinal(event) => {
             push_log(
@@ -838,19 +863,23 @@ async fn handle_server_message(
                 .write_all(format!("{}\n", serde_json::to_string(&event)?).as_bytes())
                 .await?;
             events_output.flush().await?;
+            if headless {
+                eprintln!("received transcript segment {}", event.sequence);
+            }
+            return Ok(true);
         }
         ServerMessage::TranscriptPartial(_) => {}
         ServerMessage::Warning(warning) => {
-            push_log(
-                logs,
-                format!("warning {}: {}", warning.code, warning.message),
-            )
-            .await;
+            let message = format!("warning {}: {}", warning.code, warning.message);
+            push_log(logs, &message).await;
+            if headless {
+                eprintln!("{message}");
+            }
         }
         ServerMessage::Error(error) => bail!("server error {}: {}", error.code, error.message),
         ServerMessage::Pong { .. } => {}
     }
-    Ok(())
+    Ok(false)
 }
 
 fn truncate_for_log(text: &str) -> String {
