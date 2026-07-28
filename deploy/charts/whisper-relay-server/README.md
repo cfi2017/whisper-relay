@@ -23,10 +23,11 @@ helm upgrade --install whisper-relay-server deploy/charts/whisper-relay-server \
   --set config.transcriptionBaseUrl=http://litellm.litellm.svc.cluster.local:4000 \
   --set config.transcriptionModel=whisper \
   --set config.diarizationBaseUrl=http://litellm.litellm.svc.cluster.local:4000 \
-  --set config.diarizationModel=whisper-diarized
+  --set config.diarizationModel=whisper-diarized \
+  --set config.diarizationResponseFormat=verbose_json
 ```
 
-The diarized backend must return JSON with `segments[].speaker`.
+The reference MOSS backend returns `verbose_json` with `segments[].speaker` and uses the upstream vLLM image directly.
 
 ## Gateway API
 
@@ -48,4 +49,4 @@ Full-meeting uploads default to 512 MiB WebSocket message and frame limits and a
 
 Plain WAV meetings use silence-aware server-side chunking by default. `config.targetChunkSeconds` controls normal packing, `config.maxChunkSeconds` controls forced cuts with one second of overlap, and `config.asrConcurrency` limits parallel backend requests. Smart chunking is intentionally bypassed for diarized requests so speaker identities are not reset independently in every chunk.
 
-Set `config.language` to a stable language code such as `de` to prevent per-chunk language drift. `config.prompt` can contain participant names, product names, and technical vocabulary when the selected transcription backend supports the OpenAI `prompt` field.
+Set `config.language` to a default language code such as `de` to prevent per-chunk language drift. A client session can override it with `--language`; omit both values for model language detection. `config.prompt` can contain participant names, product names, and technical vocabulary when the selected transcription backend supports the OpenAI `prompt` field.

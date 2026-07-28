@@ -61,6 +61,8 @@ oidc_issuer = "https://issuer.example.com"
 oidc_client_id = "whisper-relay-device-client"
 token_cache = "~/.cache/whisper-relay/oidc-token.json"
 diarization = "prefer"
+# Optional ISO-639-1 language for this recording, for example de, en, fr, or it.
+language = "de"
 chunk_seconds = 15
 auto_enable_new_streams = false
 audio_rescan_seconds = 2
@@ -68,6 +70,7 @@ source = ["42", "84"]
 ```
 
 Supported `diarization` values are `prefer`, `require`, and `disable`.
+Set `language` per invocation with `--language de` or `WHISPER_RELAY_LANGUAGE=de`. The session value overrides the server-wide default and is forwarded through LiteLLM to the transcription backend. Omit it to let the model detect the language.
 Configured `source` entries may be current PipeWire node IDs, node names, descriptions, or identity keys printed by `--list-sources`. When a selected stream disappears, the client keeps the capture session alive and reconnects matching streams when they reappear. Set `auto_enable_new_streams = true` to adopt newly discovered streams while capture is running.
 OIDC device-login tokens are cached by default at `$XDG_CACHE_HOME/whisper-relay/oidc-token.json` or `~/.cache/whisper-relay/oidc-token.json`. Use `token_cache` or `WHISPER_RELAY_TOKEN_CACHE` to choose a different path, or set `disable_token_cache = true` / `WHISPER_RELAY_DISABLE_TOKEN_CACHE=true` to force a fresh login.
 
@@ -94,6 +97,7 @@ The flake exposes `homeManagerModules.default` and `homeManagerModules.whisper-r
               oidc_client_id = "whisper-relay-device-client";
               token_cache = "~/.cache/whisper-relay/oidc-token.json";
               diarization = "prefer";
+              language = "de";
               auto_enable_new_streams = true;
               audio_rescan_seconds = 2;
             };
@@ -150,22 +154,23 @@ or use an existing access token with `WHISPER_RELAY_TOKEN`.
 
 ## Diarization
 
-Speaker labels require both sides to opt in. Set the client config to `diarization = "prefer"` or `diarization = "require"` and enable the server/backend path with:
+Speaker labels require both sides to opt in. Set the client config to `diarization = "prefer"` or `diarization = "require"` and enable the upstream MOSS vLLM backend with:
 
 ```yaml
 config:
   backendDiarization: true
   diarizationBaseUrl: "http://litellm.litellm.svc.cluster.local:4000"
   diarizationModel: "whisper-diarized"
+  diarizationResponseFormat: "verbose_json"
 ```
 
-or set `WHISPER_RELAY_BACKEND_DIARIZATION=true`, `WHISPER_RELAY_DIARIZATION_BASE_URL`, and `WHISPER_RELAY_DIARIZATION_MODEL` on the server. The relay then sends diarized requests to that backend and plain requests to `transcriptionBaseUrl`.
+or set `WHISPER_RELAY_BACKEND_DIARIZATION=true`, `WHISPER_RELAY_DIARIZATION_BASE_URL`, `WHISPER_RELAY_DIARIZATION_MODEL`, and `WHISPER_RELAY_DIARIZATION_RESPONSE_FORMAT=verbose_json` on the server. The relay then sends diarized requests to that backend and plain requests to `transcriptionBaseUrl`.
 
 The diarized backend must expose `/v1/audio/transcriptions` and return JSON containing segment `speaker` fields. Reference wiring lives in:
 
 - `deploy/reference/vllm-qwen3-asr.yaml`: vLLM Qwen3-ASR deployment.
-- `deploy/reference/diarized-asr.yaml`: adapter deployment that should run speaker diarization and call Qwen3-ASR for text.
-- `deploy/reference/litellm-config.yaml`: LiteLLM model entries for `whisper` and `whisper-diarized`.
+- `deploy/reference/vllm-moss-diarized.yaml`: upstream vLLM deployment for multilingual MOSS transcription and diarization.
+- `deploy/reference/litellm-config.yaml`: LiteLLM model entries for general and Swiss German transcription.
 
 ## Current V1 Boundaries
 

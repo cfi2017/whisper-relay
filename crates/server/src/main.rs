@@ -64,6 +64,13 @@ struct Args {
     #[arg(long, env = "WHISPER_RELAY_DIARIZATION_MODEL")]
     diarization_model: Option<String>,
 
+    #[arg(
+        long,
+        env = "WHISPER_RELAY_DIARIZATION_RESPONSE_FORMAT",
+        default_value = "diarized_json"
+    )]
+    diarization_response_format: String,
+
     #[arg(long, env = "WHISPER_RELAY_LANGUAGE")]
     language: Option<String>,
 
@@ -141,6 +148,7 @@ struct TranscriptionClient {
     language: Option<String>,
     timeout: Duration,
     prompt: Option<String>,
+    diarization_response_format: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -198,6 +206,7 @@ async fn main() -> Result<()> {
             language: args.language.clone(),
             timeout: Duration::from_secs(args.transcription_timeout_seconds),
             prompt: args.prompt.clone(),
+            diarization_response_format: None,
         },
         diarization: args
             .diarization_base_url
@@ -213,6 +222,7 @@ async fn main() -> Result<()> {
                 language: args.language.clone(),
                 timeout: Duration::from_secs(args.transcription_timeout_seconds),
                 prompt: args.prompt.clone(),
+                diarization_response_format: Some(args.diarization_response_format.clone()),
             }),
         chunk_seconds: args.chunk_seconds,
         backend_diarization: args.backend_diarization,
@@ -402,6 +412,7 @@ async fn handle_socket(state: Arc<AppState>, mut socket: WebSocket) -> Result<()
                     bytes.to_vec(),
                     state.backend_diarization,
                     &hello.audio,
+                    hello.language.as_deref(),
                     &state.smart_chunking,
                 );
                 tokio::pin!(transcription);
@@ -532,21 +543,28 @@ async fn transcribe_audio(
     bytes: Vec<u8>,
     diarization: bool,
     audio_format: &AudioFormat,
+    language: Option<&str>,
     config: &SmartChunkConfig,
 ) -> Result<Vec<NormalizedTranscript>> {
     if !config.enabled || diarization || audio_format.container != AudioContainer::Wav {
-        return client.transcribe(bytes, diarization, audio_format).await;
+        return client
+            .transcribe(bytes, diarization, audio_format, language)
+            .await;
     }
 
     let wav = match parse_pcm_wav(&bytes) {
         Ok(wav) if wav.bits_per_sample == 16 => wav,
         Ok(_) => {
             warn!("smart chunking supports only 16-bit PCM; forwarding whole audio");
-            return client.transcribe(bytes, false, audio_format).await;
+            return client
+                .transcribe(bytes, false, audio_format, language)
+                .await;
         }
         Err(err) => {
             warn!(%err, "could not parse WAV for smart chunking; forwarding whole audio");
-            return client.transcribe(bytes, false, audio_format).await;
+            return client
+                .transcribe(bytes, false, audio_format, language)
+                .await;
         }
     };
     let chunks = vad_chunks(&wav, config)?;
@@ -569,7 +587,9 @@ async fn transcribe_audio(
     let mut results = stream::iter(chunks.into_iter().map(|chunk| {
         let format = format.clone();
         async move {
-            let mut events = client.transcribe(chunk.wav, false, &format).await?;
+            let mut events = client
+                .transcribe(chunk.wav, false, &format, language)
+                .await?;
             for event in &mut events {
                 event.start_ms = Some(
                     event
@@ -851,6 +871,7 @@ impl TranscriptionClient {
         bytes: Vec<u8>,
         diarization: bool,
         audio_format: &AudioFormat,
+        language: Option<&str>,
     ) -> Result<Vec<NormalizedTranscript>> {
         let url = format!("{}/v1/audio/transcriptions", self.base_url);
         let (file_name, mime_type) = audio_part_metadata(audio_format);
@@ -860,16 +881,21 @@ impl TranscriptionClient {
         let mut form = multipart::Form::new()
             .text("model", self.model.clone())
             .part("file", part);
-        if let Some(language) = &self.language {
-            form = form.text("language", language.clone());
+        if let Some(language) = language.or(self.language.as_deref()) {
+            form = form.text("language", language.to_string());
         }
         if let Some(prompt) = &self.prompt {
             form = form.text("prompt", prompt.clone());
         }
         if diarization {
-            form = form
-                .text("response_format", "diarized_json")
-                .text("chunking_strategy", "auto");
+            let response_format = self
+                .diarization_response_format
+                .as_deref()
+                .unwrap_or("diarized_json");
+            form = form.text("response_format", response_format.to_string());
+            if response_format == "diarized_json" {
+                form = form.text("chunking_strategy", "auto");
+            }
         } else {
             form = form.text("response_format", "json");
         }

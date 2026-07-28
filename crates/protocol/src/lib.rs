@@ -18,6 +18,8 @@ pub struct ClientHello {
     pub client_name: String,
     pub diarization: DiarizationPreference,
     pub audio: AudioFormat,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -97,4 +99,21 @@ pub struct WarningMessage {
 pub struct ErrorMessage {
     pub code: String,
     pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_hello_without_session_language() {
+        let hello: ClientMessage = serde_json::from_str(
+            r#"{"hello":{"protocol_version":1,"client_name":"old-client","diarization":"disable","audio":{"codec":"wav_pcm16","container":"wav","sample_rate_hz":16000,"channels":1}}}"#,
+        )
+        .unwrap();
+        let ClientMessage::Hello(hello) = hello else {
+            panic!("expected hello");
+        };
+        assert_eq!(hello.language, None);
+    }
 }

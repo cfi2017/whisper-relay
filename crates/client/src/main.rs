@@ -97,6 +97,9 @@ struct CliArgs {
     #[arg(long)]
     audio_file: Option<PathBuf>,
 
+    #[arg(long, env = "WHISPER_RELAY_LANGUAGE")]
+    language: Option<String>,
+
     #[arg(long)]
     source: Vec<String>,
 
@@ -145,6 +148,7 @@ struct FileConfig {
     insecure_no_auth: Option<bool>,
     diarization: Option<DiarizationArg>,
     audio_file: Option<PathBuf>,
+    language: Option<String>,
     #[serde(default)]
     source: Vec<String>,
     chunk_seconds: Option<u64>,
@@ -167,6 +171,7 @@ struct ClientConfig {
     insecure_no_auth: bool,
     diarization: DiarizationArg,
     audio_file: Option<PathBuf>,
+    language: Option<String>,
     source: Vec<String>,
     chunk_seconds: u64,
     capture_mode: CaptureMode,
@@ -359,6 +364,7 @@ async fn main() -> Result<()> {
         client_name: hostname(),
         diarization: config.diarization.clone().into(),
         audio: config.audio_format(),
+        language: config.language.clone(),
     });
     ws.send(Message::Text(serde_json::to_string(&hello)?.into()))
         .await?;
@@ -507,6 +513,7 @@ impl ClientConfig {
                 .or(file.diarization)
                 .unwrap_or(DiarizationArg::Prefer),
             audio_file: args.audio_file.or(file.audio_file).map(expand_home),
+            language: args.language.or(file.language),
             source: if args.source.is_empty() {
                 file.source
             } else {
@@ -2071,6 +2078,7 @@ mod tests {
             insecure_no_auth: None,
             diarization: None,
             audio_file: None,
+            language: None,
             source: Vec::new(),
             list_sources: false,
             chunk_seconds: None,
@@ -2106,6 +2114,7 @@ source = ["42"]
 chunk_seconds = 30
 auto_enable_new_streams = true
 audio_rescan_seconds = 5
+language = "de"
 "#,
         )
         .unwrap();
@@ -2123,6 +2132,7 @@ audio_rescan_seconds = 5
             insecure_no_auth: None,
             diarization: None,
             audio_file: None,
+            language: None,
             source: Vec::new(),
             list_sources: false,
             chunk_seconds: None,
@@ -2138,6 +2148,7 @@ audio_rescan_seconds = 5
         assert_eq!(config.chunk_seconds, 30);
         assert!(config.auto_enable_new_streams);
         assert_eq!(config.audio_rescan_seconds, 5);
+        assert_eq!(config.language.as_deref(), Some("de"));
     }
 
     #[test]
@@ -2160,6 +2171,7 @@ audio_rescan_seconds = 5
             insecure_no_auth: true,
             diarization: DiarizationArg::Prefer,
             audio_file: None,
+            language: None,
             source: Vec::new(),
             chunk_seconds: 15,
             capture_mode: CaptureMode::Meeting,

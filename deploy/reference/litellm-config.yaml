@@ -7,18 +7,18 @@ model_list:
     model_info:
       mode: audio_transcription
 
-  - model_name: whisper-diarized
-    litellm_params:
-      model: openai/whisper-diarized
-      api_base: http://diarized-asr.vllm.svc.cluster.local:8000/v1
-      api_key: none
-    model_info:
-      mode: audio_transcription
-
   - model_name: whisper-swiss-german
     litellm_params:
       model: openai/swiss-german-whisper
       api_base: http://swiss-german-asr.vllm.svc.cluster.local:8000/v1
+      api_key: none
+    model_info:
+      mode: audio_transcription
+
+  - model_name: whisper-diarized
+    litellm_params:
+      model: openai/moss-diarized
+      api_base: http://moss-diarized-asr.vllm.svc.cluster.local:8000/v1
       api_key: none
     model_info:
       mode: audio_transcription

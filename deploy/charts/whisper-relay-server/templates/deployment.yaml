@@ -70,6 +70,8 @@ spec:
               value: {{ .Values.config.diarizationBaseUrl | quote }}
             - name: WHISPER_RELAY_DIARIZATION_MODEL
               value: {{ .Values.config.diarizationModel | quote }}
+            - name: WHISPER_RELAY_DIARIZATION_RESPONSE_FORMAT
+              value: {{ .Values.config.diarizationResponseFormat | quote }}
             {{- if .Values.config.diarizationApiKey }}
             - name: WHISPER_RELAY_DIARIZATION_API_KEY
               value: {{ .Values.config.diarizationApiKey | quote }}

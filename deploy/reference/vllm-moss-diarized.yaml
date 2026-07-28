@@ -1,10 +1,10 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: diarized-asr
+  name: moss-diarized-asr
   namespace: vllm
   labels:
-    app: diarized-asr
+    app: moss-diarized-asr
 spec:
   replicas: 1
   progressDeadlineSeconds: 3600
@@ -12,11 +12,11 @@ spec:
     type: Recreate
   selector:
     matchLabels:
-      app: diarized-asr
+      app: moss-diarized-asr
   template:
     metadata:
       labels:
-        app: diarized-asr
+        app: moss-diarized-asr
     spec:
       terminationGracePeriodSeconds: 60
       nodeSelector:
@@ -30,45 +30,43 @@ spec:
             medium: Memory
             sizeLimit: 8Gi
       containers:
-        - name: diarized-asr
-          # Build an adapter image that exposes /v1/audio/transcriptions and returns
-          # OpenAI-style JSON with segments[].speaker. It should run speaker
-          # diarization locally and call ASR_BASE_URL for segment transcription.
-          image: ghcr.io/your-org/diarized-asr:latest
+        - name: vllm
+          image: vllm/vllm-openai:latest-audio
           imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              exec vllm serve OpenMOSS-Team/MOSS-Transcribe-Diarize \
+                --served-model-name moss-diarized \
+                --trust-remote-code \
+                --dtype bfloat16 \
+                --gpu-memory-utilization 0.20 \
+                --max-model-len 65536 \
+                --max-num-seqs 2 \
+                --host 0.0.0.0 \
+                --port 8000
           env:
-            - name: ASR_BASE_URL
-              value: http://qwen3-asr.vllm.svc.cluster.local:8000/v1
-            - name: ASR_MODEL
-              value: qwen3-asr
-            - name: DIARIZATION_MODEL
-              value: pyannote/speaker-diarization-3.1
             - name: HF_HOME
               value: /root/.cache/huggingface
             - name: HF_HUB_CACHE
               value: /root/.cache/huggingface/hub
+            - name: VLLM_MAX_AUDIO_CLIP_FILESIZE_MB
+              value: "512"
             - name: NVIDIA_VISIBLE_DEVICES
               value: all
             - name: NVIDIA_DRIVER_CAPABILITIES
               value: compute,utility
-            - name: HUGGING_FACE_HUB_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: hf-token
-                  key: token
-                  optional: true
           ports:
             - name: http
               containerPort: 8000
-              protocol: TCP
           resources:
             requests:
-              cpu: "2"
-              memory: 8Gi
+              cpu: "4"
+              memory: 12Gi
               nvidia.com/gpu: "1"
             limits:
-              cpu: "8"
-              memory: 24Gi
+              cpu: "12"
+              memory: 32Gi
               nvidia.com/gpu: "1"
           volumeMounts:
             - name: cache-volume
@@ -81,7 +79,7 @@ spec:
               port: http
             periodSeconds: 10
             timeoutSeconds: 5
-            failureThreshold: 120
+            failureThreshold: 400
           readinessProbe:
             httpGet:
               path: /health
@@ -101,14 +99,13 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: diarized-asr
+  name: moss-diarized-asr
   namespace: vllm
 spec:
   selector:
-    app: diarized-asr
+    app: moss-diarized-asr
   ports:
     - name: http
       port: 8000
       targetPort: http
-      protocol: TCP
   type: ClusterIP
