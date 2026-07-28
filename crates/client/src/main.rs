@@ -965,7 +965,7 @@ fn format_ms(ms: u64) -> String {
 }
 
 enum AudioInput {
-    File(Option<PathBuf>),
+    File(Option<Vec<u8>>),
     Live(Box<LiveCapture>),
     Meeting(Box<MeetingCapture>),
 }
@@ -1005,7 +1005,10 @@ impl AudioInput {
         logs: SharedLogs,
     ) -> Result<Self> {
         if let Some(path) = &config.audio_file {
-            return Ok(Self::File(Some(path.clone())));
+            let bytes = fs::read(path)
+                .await
+                .with_context(|| format!("reading {}", path.display()))?;
+            return Ok(Self::File(Some(bytes)));
         }
         let state = audio_state.context("live capture requires audio state")?;
 
@@ -1050,12 +1053,7 @@ impl AudioInput {
 
     async fn next_chunk(&mut self) -> Result<Option<Vec<u8>>> {
         match self {
-            Self::File(path) => {
-                let Some(path) = path.take() else {
-                    return Ok(None);
-                };
-                Ok(Some(tokio::fs::read(path).await?))
-            }
+            Self::File(bytes) => Ok(bytes.take()),
             Self::Live(capture) => capture.next_chunk().await,
             Self::Meeting(capture) => capture.next_audio().await,
         }
@@ -2085,6 +2083,25 @@ mod tests {
         assert_eq!(config.audio_format().codec, AudioCodec::Opus);
         assert_eq!(config.audio_format().container, AudioContainer::Ogg);
         assert_eq!(config.audio_format().sample_rate_hz, 48_000);
+    }
+
+    #[tokio::test]
+    async fn file_input_is_preloaded_before_the_select_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meeting.wav");
+        std::fs::write(&path, b"meeting audio").unwrap();
+        let mut config = test_config();
+        config.audio_file = Some(path.clone());
+        let logs = Arc::new(RwLock::new(LogBuffer::new(10)));
+
+        let mut input = AudioInput::open(&config, None, logs).await.unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        assert_eq!(
+            input.next_chunk().await.unwrap(),
+            Some(b"meeting audio".to_vec())
+        );
+        assert_eq!(input.next_chunk().await.unwrap(), None);
     }
 
     #[test]
