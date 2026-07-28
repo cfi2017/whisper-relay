@@ -2,6 +2,8 @@
 
 This chart deploys the Whisper Relay server, its ClusterIP service, optional generated secrets, and an optional Gateway API `HTTPRoute`.
 
+Set `config.logFilter=whisper_relay_server=debug,tower_http=debug` when troubleshooting WebSocket uploads. The default is server and HTTP `info` logging.
+
 ## Install
 
 ```sh

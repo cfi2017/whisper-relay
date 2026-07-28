@@ -411,8 +411,25 @@ async fn main() -> Result<()> {
                     break;
                 };
                 if buffered_upload {
-                    for frame in chunk.chunks(1024 * 1024) {
-                        ws.send(Message::Binary(frame.to_vec().into())).await?;
+                    const FRAME_BYTES: usize = 64 * 1024;
+                    const PROGRESS_BYTES: usize = 8 * 1024 * 1024;
+                    for (index, frame) in chunk.chunks(FRAME_BYTES).enumerate() {
+                        let offset = index * FRAME_BYTES;
+                        ws.send(Message::Binary(frame.to_vec().into()))
+                            .await
+                            .with_context(|| {
+                                format!("uploading meeting audio at byte offset {offset}")
+                            })?;
+                        if headless && (offset + frame.len()) / PROGRESS_BYTES > offset / PROGRESS_BYTES {
+                            eprintln!(
+                                "uploaded {} of {} MiB",
+                                (offset + frame.len()) / (1024 * 1024),
+                                chunk.len() / (1024 * 1024)
+                            );
+                        }
+                    }
+                    if headless {
+                        eprintln!("meeting audio upload complete; waiting for transcription");
                     }
                 } else {
                     ws.send(Message::Binary(chunk.into())).await?;

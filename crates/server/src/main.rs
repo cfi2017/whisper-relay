@@ -242,7 +242,12 @@ async fn main() -> Result<()> {
         .with_state(state);
 
     let listener = TcpListener::bind(args.bind).await?;
-    info!(addr = %args.bind, "listening");
+    info!(
+        addr = %args.bind,
+        version = env!("CARGO_PKG_VERSION"),
+        protocol_version = PROTOCOL_VERSION,
+        "listening"
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -354,6 +359,14 @@ async fn handle_socket(state: Arc<AppState>, mut socket: WebSocket) -> Result<()
         return Ok(());
     };
     validate_hello(&hello, &mut socket).await?;
+    info!(
+        session_id = %session_id,
+        protocol_version = hello.protocol_version,
+        buffered_upload = hello.buffer_audio_until_end,
+        codec = ?hello.audio.codec,
+        container = ?hello.audio.container,
+        "session accepted"
+    );
 
     let diarization = if state.backend_diarization {
         DiarizationStatus::Enabled

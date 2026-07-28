@@ -36,6 +36,7 @@ service:
   targetPort: 8080
 
 config:
+  logFilter: "whisper_relay_server=info,tower_http=info"
   bind: "0.0.0.0:8080"
   insecureNoAuth: false
   oidcIssuer: ""

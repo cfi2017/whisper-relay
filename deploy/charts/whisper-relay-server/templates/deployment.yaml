@@ -39,6 +39,8 @@ spec:
               containerPort: {{ .Values.service.targetPort }}
               protocol: TCP
           env:
+            - name: RUST_LOG
+              value: {{ .Values.config.logFilter | quote }}
             - name: WHISPER_RELAY_BIND
               value: {{ .Values.config.bind | quote }}
             - name: WHISPER_RELAY_INSECURE_NO_AUTH
