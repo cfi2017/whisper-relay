@@ -28,6 +28,7 @@ use whisper_relay_protocol::{
 };
 
 #[derive(Debug, Parser)]
+#[command(version)]
 struct Args {
     #[arg(long, env = "WHISPER_RELAY_BIND", default_value = "0.0.0.0:8080")]
     bind: SocketAddr,

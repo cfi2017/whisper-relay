@@ -17,12 +17,9 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 env:
   CHART_DIR: deploy/charts/whisper-relay-server
-  CHART_PACKAGE_DIR: .chart-packages
-  OCI_REGISTRY: oci://ghcr.io/${{ github.repository_owner }}/charts
 
 jobs:
   chart:
@@ -42,33 +39,5 @@ jobs:
             --set gateway.enabled=true \
             --set 'gateway.hostnames[0]=whisper.example.com'
 
-      - name: Compute chart version
-        id: chart-version
-        shell: bash
-        run: |
-          base_version="$(awk '/^version:/ { print $2; exit }' "$CHART_DIR/Chart.yaml")"
-          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
-            version="${GITHUB_REF_NAME#v}"
-            app_version="${version}"
-          else
-            version="${base_version}-${GITHUB_SHA::7}"
-            app_version="sha-${GITHUB_SHA::7}"
-          fi
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "app-version=${app_version}" >> "$GITHUB_OUTPUT"
-
-      - name: Package chart
-        run: |
-          mkdir -p "$CHART_PACKAGE_DIR"
-          helm package "$CHART_DIR" \
-            --version "${{ steps.chart-version.outputs.version }}" \
-            --app-version "${{ steps.chart-version.outputs.app-version }}" \
-            --destination "$CHART_PACKAGE_DIR"
-
-      - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io --username "${{ github.actor }}" --password-stdin
-
-      - name: Publish chart
-        if: github.event_name != 'pull_request'
-        run: helm push "$CHART_PACKAGE_DIR"/*.tgz "$OCI_REGISTRY"
+      - name: Check release versions
+        run: ./scripts/check-versions.sh

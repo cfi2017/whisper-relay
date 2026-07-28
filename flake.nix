@@ -10,6 +10,7 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
+        workspaceVersion = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
         commonBuildInputs = with pkgs; [
           openssl
           pkg-config
@@ -37,7 +38,7 @@
 
         packages.client = pkgs.rustPlatform.buildRustPackage {
           pname = "whisper-relay-client";
-          version = "0.1.0";
+          version = workspaceVersion;
           src = self;
           cargoLock.lockFile = ./Cargo.lock;
           buildAndTestSubdir = ".";
@@ -53,7 +54,7 @@
 
         packages.server = pkgs.rustPlatform.buildRustPackage {
           pname = "whisper-relay-server";
-          version = "0.1.0";
+          version = workspaceVersion;
           src = self;
           cargoLock.lockFile = ./Cargo.lock;
           buildAndTestSubdir = ".";

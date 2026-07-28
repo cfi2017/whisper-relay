@@ -44,6 +44,7 @@ use whisper_relay_protocol::{
 };
 
 #[derive(Debug, Parser)]
+#[command(version)]
 struct CliArgs {
     #[arg(long, env = "WHISPER_RELAY_CONFIG")]
     config: Option<PathBuf>,

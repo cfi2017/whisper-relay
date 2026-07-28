@@ -126,6 +126,10 @@ Pushes to `main` run semantic-release. When a release is cut, the release workfl
 - `ghcr.io/cfi2017/whisper-relay-server:latest`
 - `oci://ghcr.io/cfi2017/charts/whisper-relay-server:<version>`
 
+Server image tags are multi-architecture manifests for `linux/amd64` and `linux/arm64`.
+
+Semantic-release updates the shared Cargo workspace version, `Cargo.lock`, chart `version`/`appVersion`, and `CHANGELOG.md` before creating the release tag. Nix client and server packages read that workspace version. Released charts leave `image.tag` empty, so Helm deploys the immutable server image matching the chart's `appVersion`; users can still override `image.tag` explicitly. The chart is published only after the corresponding GHCR image succeeds.
+
 ## Authentication
 
 Production mode expects a generic OIDC issuer and audience on the server:
