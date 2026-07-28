@@ -1,3 +1,10 @@
+# [1.9.0](https://github.com/cfi2017/whisper-relay/compare/v1.8.3...v1.9.0) (2026-07-28)
+
+
+### Features
+
+* **transcription:** support per-session languages ([26b51ae](https://github.com/cfi2017/whisper-relay/commit/26b51ae44d675225fe4d441add2ea7d65263c939))
+
 ## [1.8.3](https://github.com/cfi2017/whisper-relay/compare/v1.8.2...v1.8.3) (2026-07-28)
 
 
