@@ -1,3 +1,10 @@
+## [1.9.1](https://github.com/cfi2017/whisper-relay/compare/v1.9.0...v1.9.1) (2026-07-28)
+
+
+### Bug Fixes
+
+* **transport:** stream meeting uploads in bounded frames ([eaec791](https://github.com/cfi2017/whisper-relay/commit/eaec791100896b82c62068ea0e123385102e7719))
+
 # [1.9.0](https://github.com/cfi2017/whisper-relay/compare/v1.8.3...v1.9.0) (2026-07-28)
 
 
