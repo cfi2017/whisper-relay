@@ -1,3 +1,10 @@
+## [1.8.3](https://github.com/cfi2017/whisper-relay/compare/v1.8.2...v1.8.3) (2026-07-28)
+
+
+### Bug Fixes
+
+* **server:** keep meeting uploads alive during transcription ([5b42ead](https://github.com/cfi2017/whisper-relay/commit/5b42eadc9747fbde71271baf1c4617daf863cf07))
+
 ## [1.8.2](https://github.com/cfi2017/whisper-relay/compare/v1.8.1...v1.8.2) (2026-07-28)
 
 
