@@ -445,7 +445,7 @@ async fn main() -> Result<()> {
             }
             Ok(Message::Close(_)) => break,
             Ok(_) => {}
-            Err(err) if is_expected_shutdown_ws_error(&err) => break,
+            Err(err) if !headless && is_expected_shutdown_ws_error(&err) => break,
             Err(err) => return Err(err.into()),
         }
     }

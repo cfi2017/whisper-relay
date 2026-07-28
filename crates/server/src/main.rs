@@ -397,15 +397,26 @@ async fn handle_socket(state: Arc<AppState>, mut socket: WebSocket) -> Result<()
                 } else {
                     &state.transcription
                 };
-                match transcribe_audio(
+                let transcription = transcribe_audio(
                     transcription,
                     bytes.to_vec(),
                     state.backend_diarization,
                     &hello.audio,
                     &state.smart_chunking,
-                )
-                .await
-                {
+                );
+                tokio::pin!(transcription);
+                let mut keepalive = tokio::time::interval(Duration::from_secs(15));
+                keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                keepalive.tick().await;
+                let result = loop {
+                    tokio::select! {
+                        result = &mut transcription => break result,
+                        _ = keepalive.tick() => {
+                            socket.send(Message::Ping(Vec::new().into())).await?;
+                        }
+                    }
+                };
+                match result {
                     Ok(events) => {
                         if events.is_empty() {
                             send_json(
