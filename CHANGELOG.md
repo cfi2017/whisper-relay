@@ -1,3 +1,10 @@
+## [1.9.3](https://github.com/cfi2017/whisper-relay/compare/v1.9.2...v1.9.3) (2026-07-28)
+
+
+### Bug Fixes
+
+* **client:** make file uploads cancellation safe ([fe5f05f](https://github.com/cfi2017/whisper-relay/commit/fe5f05f95b0597424454963d8767eec4ba46819d))
+
 ## [1.9.2](https://github.com/cfi2017/whisper-relay/compare/v1.9.1...v1.9.2) (2026-07-28)
 
 
