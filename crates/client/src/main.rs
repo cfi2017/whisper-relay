@@ -359,12 +359,15 @@ async fn main() -> Result<()> {
 
     let (mut ws, _) = connect_async(request).await?;
     push_log(&logs, "connected to server").await;
+    let buffered_upload =
+        config.audio_file.is_some() || config.capture_mode == CaptureMode::Meeting;
     let hello = ClientMessage::Hello(ClientHello {
         protocol_version: PROTOCOL_VERSION,
         client_name: hostname(),
         diarization: config.diarization.clone().into(),
         audio: config.audio_format(),
         language: config.language.clone(),
+        buffer_audio_until_end: buffered_upload,
     });
     ws.send(Message::Text(serde_json::to_string(&hello)?.into()))
         .await?;
@@ -407,7 +410,13 @@ async fn main() -> Result<()> {
                     }
                     break;
                 };
-                ws.send(Message::Binary(chunk.into())).await?;
+                if buffered_upload {
+                    for frame in chunk.chunks(1024 * 1024) {
+                        ws.send(Message::Binary(frame.to_vec().into())).await?;
+                    }
+                } else {
+                    ws.send(Message::Binary(chunk.into())).await?;
+                }
             }
             message = ws.next() => {
                 match message {

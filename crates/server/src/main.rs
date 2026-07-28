@@ -394,81 +394,55 @@ async fn handle_socket(state: Arc<AppState>, mut socket: WebSocket) -> Result<()
     }
 
     let mut sequence = 0_u64;
+    let mut buffered_audio = Vec::new();
     while let Some(message) = socket.next().await {
         match message? {
             Message::Binary(bytes) => {
                 if bytes.is_empty() {
                     continue;
                 }
-                sequence += 1;
-                debug!(session_id = %session_id, sequence, bytes = bytes.len(), "transcribing chunk");
-                let transcription = if state.backend_diarization {
-                    state.diarization.as_ref().unwrap_or(&state.transcription)
-                } else {
-                    &state.transcription
-                };
-                let transcription = transcribe_audio(
-                    transcription,
-                    bytes.to_vec(),
-                    state.backend_diarization,
-                    &hello.audio,
-                    hello.language.as_deref(),
-                    &state.smart_chunking,
-                );
-                tokio::pin!(transcription);
-                let mut keepalive = tokio::time::interval(Duration::from_secs(15));
-                keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                keepalive.tick().await;
-                let result = loop {
-                    tokio::select! {
-                        result = &mut transcription => break result,
-                        _ = keepalive.tick() => {
-                            socket.send(Message::Ping(Vec::new().into())).await?;
-                        }
-                    }
-                };
-                match result {
-                    Ok(events) => {
-                        if events.is_empty() {
-                            send_json(
-                                &mut socket,
-                                &ServerMessage::Warning(WarningMessage {
-                                    code: "no_transcript".into(),
-                                    message: "no speech or transcript text was detected".into(),
-                                }),
-                            )
-                            .await?;
-                        }
-                        for event in events {
-                            send_json(
-                                &mut socket,
-                                &ServerMessage::TranscriptFinal(TranscriptEvent {
-                                    session_id,
-                                    sequence,
-                                    received_at: Utc::now(),
-                                    start_ms: event.start_ms,
-                                    end_ms: event.end_ms,
-                                    speaker: event.speaker,
-                                    text: event.text,
-                                }),
-                            )
-                            .await?;
-                        }
-                    }
-                    Err(err) => {
-                        send_json(
+                if hello.buffer_audio_until_end {
+                    if buffered_audio.len().saturating_add(bytes.len()) > state.max_audio_bytes {
+                        send_error(
                             &mut socket,
-                            &ServerMessage::Error(ErrorMessage {
-                                code: "transcription_failed".into(),
-                                message: err.to_string(),
-                            }),
+                            "audio_too_large",
+                            "buffered audio exceeds the configured server limit",
                         )
                         .await?;
+                        break;
                     }
+                    buffered_audio.extend_from_slice(&bytes);
+                    debug!(session_id = %session_id, frame_bytes = bytes.len(), total_bytes = buffered_audio.len(), "buffered meeting frame");
+                } else {
+                    sequence += 1;
+                    transcribe_and_send(
+                        &state,
+                        &hello,
+                        &mut socket,
+                        session_id,
+                        sequence,
+                        bytes.to_vec(),
+                    )
+                    .await?;
                 }
             }
             Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text)? {
-                ClientMessage::AudioEnd => break,
+                ClientMessage::AudioEnd => {
+                    if hello.buffer_audio_until_end && !buffered_audio.is_empty() {
+                        sequence += 1;
+                        info!(session_id = %session_id, bytes = buffered_audio.len(), "meeting upload complete");
+                        transcribe_and_send(
+                            &state,
+                            &hello,
+                            &mut socket,
+                            session_id,
+                            sequence,
+                            std::mem::take(&mut buffered_audio),
+                        )
+                        .await?;
+                    }
+                    break;
+                }
                 ClientMessage::Ping { nonce } => {
                     send_json(&mut socket, &ServerMessage::Pong { nonce }).await?
                 }
@@ -492,17 +466,93 @@ async fn handle_socket(state: Arc<AppState>, mut socket: WebSocket) -> Result<()
     Ok(())
 }
 
+async fn transcribe_and_send(
+    state: &AppState,
+    hello: &ClientHello,
+    socket: &mut WebSocket,
+    session_id: Uuid,
+    sequence: u64,
+    bytes: Vec<u8>,
+) -> Result<()> {
+    debug!(session_id = %session_id, sequence, bytes = bytes.len(), "transcribing audio");
+    let transcription = if state.backend_diarization {
+        state.diarization.as_ref().unwrap_or(&state.transcription)
+    } else {
+        &state.transcription
+    };
+    let transcription = transcribe_audio(
+        transcription,
+        bytes,
+        state.backend_diarization,
+        &hello.audio,
+        hello.language.as_deref(),
+        &state.smart_chunking,
+    );
+    tokio::pin!(transcription);
+    let mut keepalive = tokio::time::interval(Duration::from_secs(15));
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    keepalive.tick().await;
+    let result = loop {
+        tokio::select! {
+            result = &mut transcription => break result,
+            _ = keepalive.tick() => socket.send(Message::Ping(Vec::new().into())).await?,
+        }
+    };
+    match result {
+        Ok(events) => {
+            if events.is_empty() {
+                send_json(
+                    socket,
+                    &ServerMessage::Warning(WarningMessage {
+                        code: "no_transcript".into(),
+                        message: "no speech or transcript text was detected".into(),
+                    }),
+                )
+                .await?;
+            }
+            for event in events {
+                send_json(
+                    socket,
+                    &ServerMessage::TranscriptFinal(TranscriptEvent {
+                        session_id,
+                        sequence,
+                        received_at: Utc::now(),
+                        start_ms: event.start_ms,
+                        end_ms: event.end_ms,
+                        speaker: event.speaker,
+                        text: event.text,
+                    }),
+                )
+                .await?;
+            }
+        }
+        Err(err) => {
+            send_json(
+                socket,
+                &ServerMessage::Error(ErrorMessage {
+                    code: "transcription_failed".into(),
+                    message: err.to_string(),
+                }),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 async fn validate_hello(hello: &ClientHello, socket: &mut WebSocket) -> Result<()> {
-    if hello.protocol_version != PROTOCOL_VERSION {
-        send_error(
-            socket,
-            "protocol_version",
-            &format!(
-                "unsupported protocol version {}; server supports {}",
-                hello.protocol_version, PROTOCOL_VERSION
-            ),
-        )
-        .await?;
+    if !(1..=PROTOCOL_VERSION).contains(&hello.protocol_version) {
+        let message = format!(
+            "unsupported protocol version {}; server supports versions 1 through {}",
+            hello.protocol_version, PROTOCOL_VERSION
+        );
+        send_error(socket, "protocol_version", &message).await?;
+        bail!(message);
+    }
+    if hello.buffer_audio_until_end && hello.protocol_version < 2 {
+        let message = "buffered meeting uploads require protocol version 2";
+        send_error(socket, "protocol_version", message).await?;
+        bail!(message);
     }
     Ok(())
 }
