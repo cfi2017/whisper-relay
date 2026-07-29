@@ -43,6 +43,7 @@ helm upgrade --install whisper-relay-server deploy/charts/whisper-relay-server \
 
 The reference MOSS backend returns `verbose_json` with `segments[].speaker` and uses the upstream vLLM image directly.
 When both model routes use LiteLLM, the diarization client inherits the transcription API key. Set `config.diarizationApiKey` only for a backend with separate credentials.
+`verbose_json` is the default response format. Set `config.diarizationResponseFormat=diarized_json` only for a backend implementing OpenAI's dedicated diarization response format.
 
 ## Gateway API
 

@@ -46,7 +46,7 @@ config:
   transcriptionApiKey: ""
   diarizationBaseUrl: ""
   diarizationModel: "whisper-diarized"
-  diarizationResponseFormat: "diarized_json"
+  diarizationResponseFormat: "verbose_json"
   diarizationApiKey: ""
   transcriptionApiKeySecret:
     name: ""

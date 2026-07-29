@@ -67,7 +67,7 @@ struct Args {
     #[arg(
         long,
         env = "WHISPER_RELAY_DIARIZATION_RESPONSE_FORMAT",
-        default_value = "diarized_json"
+        default_value = "verbose_json"
     )]
     diarization_response_format: String,
 
@@ -964,7 +964,7 @@ impl TranscriptionClient {
             let response_format = self
                 .diarization_response_format
                 .as_deref()
-                .unwrap_or("diarized_json");
+                .unwrap_or("verbose_json");
             form = form.text("response_format", response_format.to_string());
             if response_format == "diarized_json" {
                 form = form.text("chunking_strategy", "auto");
@@ -1051,6 +1051,17 @@ async fn send_error(socket: &mut WebSocket, code: &str, message: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn defaults_to_vllm_diarization_response_format() {
+        let args = Args::try_parse_from([
+            "whisper-relay-server",
+            "--transcription-base-url",
+            "http://localhost:4000",
+        ])
+        .unwrap();
+        assert_eq!(args.diarization_response_format, "verbose_json");
+    }
 
     #[test]
     fn normalizes_plain_text_response() {
