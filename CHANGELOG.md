@@ -1,3 +1,10 @@
+## [1.9.7](https://github.com/cfi2017/whisper-relay/compare/v1.9.6...v1.9.7) (2026-07-29)
+
+
+### Bug Fixes
+
+* **diarization:** route moss directly to vllm ([84eb52d](https://github.com/cfi2017/whisper-relay/commit/84eb52db235d32fbe2cac2f766159609776e196a))
+
 ## [1.9.6](https://github.com/cfi2017/whisper-relay/compare/v1.9.5...v1.9.6) (2026-07-29)
 
 
