@@ -36,13 +36,13 @@ helm upgrade --install whisper-relay-server deploy/charts/whisper-relay-server \
   --set config.backendDiarization=true \
   --set config.transcriptionBaseUrl=http://litellm.litellm.svc.cluster.local:4000 \
   --set config.transcriptionModel=whisper \
-  --set config.diarizationBaseUrl=http://litellm.litellm.svc.cluster.local:4000 \
-  --set config.diarizationModel=whisper-diarized \
+  --set config.diarizationBaseUrl=http://moss-diarized-asr.vllm.svc.cluster.local:8000 \
+  --set config.diarizationModel=moss-diarized \
   --set config.diarizationResponseFormat=verbose_json
 ```
 
-The reference MOSS backend returns `verbose_json` with `segments[].speaker` and uses the upstream vLLM image directly.
-When both model routes use LiteLLM, the diarization client inherits the transcription API key. Set `config.diarizationApiKey` only for a backend with separate credentials.
+The reference MOSS backend returns `verbose_json` with `segments[].speaker` and uses the upstream vLLM image directly. LiteLLM currently rejects this format for hosted-vLLM transcription, so the diarization URL must point directly to the MOSS Service. The plain transcription route can continue through LiteLLM.
+The diarization client inherits the transcription API key unless `config.diarizationApiKey` is set. An unsecured in-cluster vLLM endpoint ignores the extra authorization header.
 `verbose_json` is the default response format. Set `config.diarizationResponseFormat=diarized_json` only for a backend implementing OpenAI's dedicated diarization response format.
 
 ## Gateway API

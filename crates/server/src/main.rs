@@ -225,7 +225,7 @@ async fn main() -> Result<()> {
                 model: args
                     .diarization_model
                     .clone()
-                    .unwrap_or_else(|| "whisper-diarized".into()),
+                    .unwrap_or_else(|| "moss-diarized".into()),
                 language: args.language.clone(),
                 timeout: Duration::from_secs(args.transcription_timeout_seconds),
                 prompt: args.prompt.clone(),

@@ -45,7 +45,7 @@ config:
   transcriptionModel: "whisper"
   transcriptionApiKey: ""
   diarizationBaseUrl: ""
-  diarizationModel: "whisper-diarized"
+  diarizationModel: "moss-diarized"
   diarizationResponseFormat: "verbose_json"
   diarizationApiKey: ""
   transcriptionApiKeySecret:

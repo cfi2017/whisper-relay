@@ -159,12 +159,12 @@ Speaker labels require both sides to opt in. Set the client config to `diarizati
 ```yaml
 config:
   backendDiarization: true
-  diarizationBaseUrl: "http://litellm.litellm.svc.cluster.local:4000"
-  diarizationModel: "whisper-diarized"
+  diarizationBaseUrl: "http://moss-diarized-asr.vllm.svc.cluster.local:8000"
+  diarizationModel: "moss-diarized"
   diarizationResponseFormat: "verbose_json"
 ```
 
-or set `WHISPER_RELAY_BACKEND_DIARIZATION=true`, `WHISPER_RELAY_DIARIZATION_BASE_URL`, `WHISPER_RELAY_DIARIZATION_MODEL`, and `WHISPER_RELAY_DIARIZATION_RESPONSE_FORMAT=verbose_json` on the server. The relay then sends diarized requests to that backend and plain requests to `transcriptionBaseUrl`.
+or set `WHISPER_RELAY_BACKEND_DIARIZATION=true`, `WHISPER_RELAY_DIARIZATION_BASE_URL`, `WHISPER_RELAY_DIARIZATION_MODEL`, and `WHISPER_RELAY_DIARIZATION_RESPONSE_FORMAT=verbose_json` on the server. The relay then sends diarized requests directly to MOSS and plain requests to `transcriptionBaseUrl` through LiteLLM. Do not add MOSS to LiteLLM: LiteLLM's hosted-vLLM transcription adapter rejects the `verbose_json` response format required for speaker segments.
 
 The diarization client inherits `WHISPER_RELAY_TRANSCRIPTION_API_KEY` when `WHISPER_RELAY_DIARIZATION_API_KEY` is unset. Set the latter only when the diarization backend uses different credentials.
 
@@ -172,7 +172,7 @@ The diarized backend must expose `/v1/audio/transcriptions` and return JSON cont
 
 - `deploy/reference/vllm-qwen3-asr.yaml`: vLLM Qwen3-ASR deployment.
 - `deploy/reference/vllm-moss-diarized.yaml`: upstream vLLM deployment for multilingual MOSS transcription and diarization.
-- `deploy/reference/litellm-config.yaml`: LiteLLM model entries for general and Swiss German transcription.
+- `deploy/reference/litellm-config.yaml`: LiteLLM model entries for plain general and Swiss German transcription.
 
 ## Current V1 Boundaries
 
