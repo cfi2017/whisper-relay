@@ -1,3 +1,10 @@
+## [1.9.6](https://github.com/cfi2017/whisper-relay/compare/v1.9.5...v1.9.6) (2026-07-29)
+
+
+### Bug Fixes
+
+* **diarization:** default to vllm response format ([d4d0056](https://github.com/cfi2017/whisper-relay/commit/d4d0056eae58b0f5c352e176225afbbffffd62c2))
+
 ## [1.9.5](https://github.com/cfi2017/whisper-relay/compare/v1.9.4...v1.9.5) (2026-07-28)
 
 
